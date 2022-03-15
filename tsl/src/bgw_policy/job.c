@@ -8,15 +8,17 @@
 #include <access/xact.h>
 #include <catalog/namespace.h>
 #include <catalog/pg_type.h>
-#include <continuous_agg.h>
 #include <funcapi.h>
 #include <hypertable_cache.h>
 #include <nodes/makefuncs.h>
 #include <nodes/pg_list.h>
 #include <nodes/primnodes.h>
 #include <parser/parse_func.h>
+#include <parser/parser.h>
+#include <tcop/pquery.h>
 #include <utils/builtins.h>
 #include <utils/lsyscache.h>
+#include <utils/portal.h>
 #include <utils/syscache.h>
 #include <utils/snapmgr.h>
 #include <utils/timestamp.h>
@@ -31,9 +33,11 @@
 #include "bgw_policy/policy_utils.h"
 #include "bgw_policy/reorder_api.h"
 #include "bgw_policy/retention_api.h"
+#include "compat/compat.h"
 #include "compression/compress_utils.h"
 #include "continuous_aggs/materialize.h"
 #include "continuous_aggs/refresh.h"
+#include "ts_catalog/continuous_agg.h"
 
 #include "tsl/src/chunk.h"
 
@@ -117,7 +121,7 @@ get_window_boundary(const Dimension *dim, const Jsonb *config, int64 (*int_gette
 
 		Assert(now_func);
 
-		res = subtract_integer_from_now(lag, partitioning_type, now_func);
+		res = ts_sub_integer_from_now(lag, partitioning_type, now_func);
 		return Int64GetDatum(res);
 	}
 	else
@@ -127,47 +131,27 @@ get_window_boundary(const Dimension *dim, const Jsonb *config, int64 (*int_gette
 	}
 }
 
-static int32
-get_chunk_to_compress(const Dimension *dim, const Jsonb *config)
-{
-	Oid partitioning_type = ts_dimension_get_partition_type(dim);
-	StrategyNumber end_strategy = BTLessStrategyNumber;
-	bool recompress = policy_compression_get_recompress(config);
-
-	Datum boundary = get_window_boundary(dim,
-										 config,
-										 policy_compression_get_compress_after_int,
-										 policy_compression_get_compress_after_interval);
-
-	return ts_dimension_slice_get_chunkid_to_compress(dim->fd.id,
-													  InvalidStrategy, /*start_strategy*/
-													  -1,			   /*start_value*/
-													  end_strategy,
-													  ts_time_value_to_internal(boundary,
-																				partitioning_type),
-													  true,
-													  recompress);
-}
-
-static int32
+static List *
 get_chunk_to_recompress(const Dimension *dim, const Jsonb *config)
 {
 	Oid partitioning_type = ts_dimension_get_partition_type(dim);
 	StrategyNumber end_strategy = BTLessStrategyNumber;
+	int32 numchunks = policy_compression_get_maxchunks_per_job(config);
 
 	Datum boundary = get_window_boundary(dim,
 										 config,
 										 policy_recompression_get_recompress_after_int,
 										 policy_recompression_get_recompress_after_interval);
 
-	return ts_dimension_slice_get_chunkid_to_compress(dim->fd.id,
-													  InvalidStrategy, /*start_strategy*/
-													  -1,			   /*start_value*/
-													  end_strategy,
-													  ts_time_value_to_internal(boundary,
-																				partitioning_type),
-													  false,
-													  true);
+	return ts_dimension_slice_get_chunkids_to_compress(dim->fd.id,
+													   InvalidStrategy, /*start_strategy*/
+													   -1,				/*start_value*/
+													   end_strategy,
+													   ts_time_value_to_internal(boundary,
+																				 partitioning_type),
+													   false,
+													   true,
+													   numchunks);
 }
 
 static void
@@ -260,30 +244,6 @@ policy_reorder_read_and_validate_config(Jsonb *config, PolicyReorderData *policy
 		policy->index_relid =
 			get_relname_relid(index_name, get_namespace_oid(NameStr(ht->fd.schema_name), false));
 	}
-}
-
-static const Dimension *
-get_open_dimension_for_hypertable(const Hypertable *ht)
-{
-	int32 mat_id = ht->fd.id;
-	const Dimension *open_dim = hyperspace_get_open_dimension(ht->space, 0);
-	Oid partitioning_type = ts_dimension_get_partition_type(open_dim);
-	if (IS_INTEGER_TYPE(partitioning_type))
-	{
-		/* if this a materialization hypertable related to cont agg
-		 * then need to get the right dimension which has
-		 * integer_now function
-		 */
-
-		open_dim = ts_continuous_agg_find_integer_now_func_by_materialization_id(mat_id);
-		if (open_dim == NULL)
-		{
-			elog(ERROR,
-				 "missing integer_now function for hypertable \"%s\" ",
-				 get_rel_name(ht->main_table_relid));
-		}
-	}
-	return open_dim;
 }
 
 bool
@@ -397,63 +357,6 @@ policy_refresh_cagg_read_and_validate_config(Jsonb *config, PolicyContinuousAggD
 }
 
 /*
- * Invoke compress_chunk via fmgr so that the call can be deparsed and sent to
- * remote data nodes.
- */
-static void
-policy_invoke_compress_chunk(Chunk *chunk)
-{
-	EState *estate;
-	ExprContext *econtext;
-	FuncExpr *fexpr;
-	Oid relid = chunk->table_id;
-	Oid restype;
-	Oid func_oid;
-	List *args = NIL;
-	int i;
-	bool isnull;
-	Const *argarr[COMPRESS_CHUNK_NARGS] = {
-		makeConst(REGCLASSOID,
-				  -1,
-				  InvalidOid,
-				  sizeof(relid),
-				  ObjectIdGetDatum(relid),
-				  false,
-				  false),
-		castNode(Const, makeBoolConst(true, false)),
-	};
-	Oid type_id[COMPRESS_CHUNK_NARGS] = { REGCLASSOID, BOOLOID };
-	char *schema_name = ts_extension_schema_name();
-	List *fqn = list_make2(makeString(schema_name), makeString(COMPRESS_CHUNK_FUNCNAME));
-
-	StaticAssertStmt(lengthof(type_id) == lengthof(argarr),
-					 "argarr and type_id should have matching lengths");
-
-	func_oid = LookupFuncName(fqn, lengthof(type_id), type_id, false);
-	Assert(func_oid); /* LookupFuncName should not return an invalid OID */
-
-	/* Prepare the function expr with argument list */
-	get_func_result_type(func_oid, &restype, NULL);
-
-	for (i = 0; i < lengthof(argarr); i++)
-		args = lappend(args, argarr[i]);
-
-	fexpr = makeFuncExpr(func_oid, restype, args, InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
-	fexpr->funcretset = false;
-
-	estate = CreateExecutorState();
-	econtext = CreateExprContext(estate);
-
-	ExprState *exprstate = ExecInitExpr(&fexpr->xpr, NULL);
-
-	ExecEvalExprSwitchContext(exprstate, econtext, &isnull);
-
-	/* Cleanup */
-	FreeExprContext(econtext, false);
-	FreeExecutorState(estate);
-}
-
-/*
  * Invoke recompress_chunk via fmgr so that the call can be deparsed and sent to
  * remote data nodes.
  */
@@ -510,56 +413,6 @@ policy_invoke_recompress_chunk(Chunk *chunk)
 	FreeExecutorState(estate);
 }
 
-bool
-policy_compression_execute(int32 job_id, Jsonb *config)
-{
-	int32 chunkid;
-	const Dimension *dim;
-	PolicyCompressionData policy_data;
-
-	policy_compression_read_and_validate_config(config, &policy_data);
-	dim = hyperspace_get_open_dimension(policy_data.hypertable->space, 0);
-	chunkid = get_chunk_to_compress(dim, config);
-
-	if (chunkid == INVALID_CHUNK_ID)
-		elog(NOTICE,
-			 "no chunks for hypertable %s.%s that satisfy compress chunk policy",
-			 policy_data.hypertable->fd.schema_name.data,
-			 policy_data.hypertable->fd.table_name.data);
-
-	if (chunkid != INVALID_CHUNK_ID)
-	{
-		Chunk *chunk = ts_chunk_get_by_id(chunkid, true);
-		if (hypertable_is_distributed(policy_data.hypertable))
-		{
-			if (ts_chunk_is_unordered(chunk))
-				policy_invoke_recompress_chunk(chunk);
-			else
-				policy_invoke_compress_chunk(chunk);
-		}
-		else
-		{
-			if (ts_chunk_is_unordered(chunk))
-				tsl_recompress_chunk_wrapper(chunk);
-			else
-				tsl_compress_chunk_wrapper(chunk, true);
-		}
-		elog(LOG,
-			 "completed compressing chunk %s.%s",
-			 NameStr(chunk->fd.schema_name),
-			 NameStr(chunk->fd.table_name));
-	}
-
-	chunkid = get_chunk_to_compress(dim, config);
-	if (chunkid != INVALID_CHUNK_ID)
-		enable_fast_restart(job_id, "compression");
-
-	ts_cache_release(policy_data.hcache);
-
-	elog(DEBUG1, "job %d completed compressing chunk", job_id);
-	return true;
-}
-
 /* Read configuration for compression job from config object. */
 void
 policy_compression_read_and_validate_config(Jsonb *config, PolicyCompressionData *policy_data)
@@ -592,24 +445,60 @@ policy_recompression_read_and_validate_config(Jsonb *config, PolicyCompressionDa
 bool
 policy_recompression_execute(int32 job_id, Jsonb *config)
 {
-	int32 chunkid;
+	List *chunkid_lst;
+	ListCell *lc;
 	const Dimension *dim;
 	PolicyCompressionData policy_data;
+	bool distributed, used_portalcxt = false;
+	MemoryContext saved_cxt, multitxn_cxt;
 
 	policy_recompression_read_and_validate_config(config, &policy_data);
 	dim = hyperspace_get_open_dimension(policy_data.hypertable->space, 0);
-	chunkid = get_chunk_to_recompress(dim, config);
+	distributed = hypertable_is_distributed(policy_data.hypertable);
+	/* we want the chunk id list to survive across transactions. So alloc in
+	 * a different context
+	 */
+	if (PortalContext)
+	{
+		/*if we have a portal context use that - it will get freed automatically*/
+		multitxn_cxt = PortalContext;
+		used_portalcxt = true;
+	}
+	else
+	{
+		/* background worker job does not go via usual CALL path, so we do
+		 * not have a PortalContext */
+		multitxn_cxt =
+			AllocSetContextCreate(TopMemoryContext, "CompressionJobCxt", ALLOCSET_DEFAULT_SIZES);
+	}
+	saved_cxt = MemoryContextSwitchTo(multitxn_cxt);
+	chunkid_lst = get_chunk_to_recompress(dim, config);
+	MemoryContextSwitchTo(saved_cxt);
 
-	if (chunkid == INVALID_CHUNK_ID)
+	if (!chunkid_lst)
+	{
 		elog(NOTICE,
 			 "no chunks for hypertable \"%s.%s\" that satisfy recompress chunk policy",
 			 policy_data.hypertable->fd.schema_name.data,
 			 policy_data.hypertable->fd.table_name.data);
-
-	if (chunkid != INVALID_CHUNK_ID)
+		ts_cache_release(policy_data.hcache);
+		if (!used_portalcxt)
+			MemoryContextDelete(multitxn_cxt);
+		return true;
+	}
+	ts_cache_release(policy_data.hcache);
+	if (ActiveSnapshotSet())
+		PopActiveSnapshot();
+	/* process each chunk in a new transaction */
+	foreach (lc, chunkid_lst)
 	{
+		CommitTransactionCommand();
+		StartTransactionCommand();
+		int32 chunkid = lfirst_int(lc);
 		Chunk *chunk = ts_chunk_get_by_id(chunkid, true);
-		if (hypertable_is_distributed(policy_data.hypertable))
+		if (!chunk || !ts_chunk_is_unordered(chunk))
+			continue;
+		if (distributed)
 			policy_invoke_recompress_chunk(chunk);
 		else
 			tsl_recompress_chunk_wrapper(chunk);
@@ -619,12 +508,6 @@ policy_recompression_execute(int32 job_id, Jsonb *config)
 			 NameStr(chunk->fd.schema_name),
 			 NameStr(chunk->fd.table_name));
 	}
-
-	chunkid = get_chunk_to_recompress(dim, config);
-	if (chunkid != INVALID_CHUNK_ID)
-		enable_fast_restart(job_id, "recompression");
-
-	ts_cache_release(policy_data.hcache);
 
 	elog(DEBUG1, "job %d completed recompressing chunk", job_id);
 	return true;
@@ -660,32 +543,37 @@ bool
 job_execute(BgwJob *job)
 {
 	Const *arg1, *arg2;
-	bool transaction_started = false;
-	bool pushed_snapshot = false;
+	bool portal_created = false;
 	char prokind;
 	Oid proc;
-	Oid proc_args[] = { INT4OID, JSONBOID };
-	List *name;
+	ObjectWithArgs *object;
 	FuncExpr *funcexpr;
 	MemoryContext parent_ctx = CurrentMemoryContext;
 	StringInfo query;
+	Portal portal = ActivePortal;
 
-	if (!IsTransactionOrTransactionBlock())
+	/* Create a portal if there's no active */
+	if (!PortalIsValid(portal))
 	{
-		transaction_started = true;
+		portal_created = true;
+		portal = CreatePortal("", true, true);
+		portal->visible = false;
+		portal->resowner = CurrentResourceOwner;
+		ActivePortal = portal;
+
 		StartTransactionCommand();
-	}
-
-	/* executing sql functions requires snapshot. */
-	if (!ActiveSnapshotSet())
-	{
-		pushed_snapshot = true;
+#if (PG12 && PG_VERSION_NUM >= 120008) || (PG13 && PG_VERSION_NUM >= 130004) || PG14_GE
+		EnsurePortalSnapshotExists();
+#else
 		PushActiveSnapshot(GetTransactionSnapshot());
+#endif
 	}
 
-	name = list_make2(makeString(NameStr(job->fd.proc_schema)),
-					  makeString(NameStr(job->fd.proc_name)));
-	proc = LookupFuncName(name, 2, proc_args, false);
+	object = makeNode(ObjectWithArgs);
+	object->objname = list_make2(makeString(NameStr(job->fd.proc_schema)),
+								 makeString(NameStr(job->fd.proc_name)));
+	object->objargs = list_make2(SystemTypeName("int4"), SystemTypeName("jsonb"));
+	proc = LookupFuncWithArgs(OBJECT_ROUTINE, object, false);
 
 	prokind = get_func_prokind(proc);
 
@@ -737,16 +625,38 @@ job_execute(BgwJob *job)
 			break;
 	}
 
-	/* Both checks are needed: if the executed procedure commit the
-	 * transaction---which `continuous_agg_refresh_internal` does, for
-	 * example---it will remove the active snapshot and start a new
-	 * transaction with no active snapshots. In that case, we should not pop a
-	 * snapshot. */
-	if (pushed_snapshot && ActiveSnapshotSet())
-		PopActiveSnapshot();
-
-	if (transaction_started)
+	/* Drop portal if it was created */
+	if (portal_created)
+	{
+		if (ActiveSnapshotSet())
+			PopActiveSnapshot();
 		CommitTransactionCommand();
+		PortalDrop(portal, false);
+		ActivePortal = NULL;
+	}
 
 	return true;
+}
+
+/*
+ * Check configuration for a job type.
+ */
+void
+job_config_check(Name proc_schema, Name proc_name, Jsonb *config)
+{
+	if (namestrcmp(proc_schema, INTERNAL_SCHEMA_NAME) == 0)
+	{
+		if (namestrcmp(proc_name, "policy_retention") == 0)
+			policy_retention_read_and_validate_config(config, NULL);
+		else if (namestrcmp(proc_name, "policy_reorder") == 0)
+			policy_reorder_read_and_validate_config(config, NULL);
+		else if (namestrcmp(proc_name, "policy_compression") == 0)
+		{
+			PolicyCompressionData policy_data;
+			policy_compression_read_and_validate_config(config, &policy_data);
+			ts_cache_release(policy_data.hcache);
+		}
+		else if (namestrcmp(proc_name, "policy_refresh_continuous_aggregate") == 0)
+			policy_refresh_cagg_read_and_validate_config(config, NULL);
+	}
 }

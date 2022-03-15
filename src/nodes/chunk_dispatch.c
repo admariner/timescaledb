@@ -11,7 +11,7 @@
 #include <utils/rel.h>
 #include <catalog/pg_type.h>
 
-#include "compat.h"
+#include "compat/compat.h"
 #include "chunk_dispatch.h"
 #include "chunk_insert_state.h"
 #include "subspace_store.h"
@@ -50,7 +50,7 @@ get_modifytable(const ChunkDispatch *dispatch)
 bool
 ts_chunk_dispatch_has_returning(const ChunkDispatch *dispatch)
 {
-	if (NULL == dispatch->dispatch_state)
+	if (!dispatch->dispatch_state)
 		return false;
 	return get_modifytable(dispatch)->returningLists != NIL;
 }
@@ -58,9 +58,13 @@ ts_chunk_dispatch_has_returning(const ChunkDispatch *dispatch)
 List *
 ts_chunk_dispatch_get_returning_clauses(const ChunkDispatch *dispatch)
 {
-	ModifyTableState *mtstate = dispatch->dispatch_state->mtstate;
-
+#if PG14_LT
+	ModifyTableState *mtstate = get_modifytable_state(dispatch);
 	return list_nth(get_modifytable(dispatch)->returningLists, mtstate->mt_whichplan);
+#else
+	Assert(list_length(get_modifytable(dispatch)->returningLists) == 1);
+	return linitial(get_modifytable(dispatch)->returningLists);
+#endif
 }
 
 List *
@@ -72,7 +76,7 @@ ts_chunk_dispatch_get_arbiter_indexes(const ChunkDispatch *dispatch)
 OnConflictAction
 ts_chunk_dispatch_get_on_conflict_action(const ChunkDispatch *dispatch)
 {
-	if (NULL == dispatch->dispatch_state)
+	if (!dispatch->dispatch_state)
 		return ONCONFLICT_NONE;
 	return get_modifytable(dispatch)->onConflictAction;
 }
@@ -81,12 +85,6 @@ List *
 ts_chunk_dispatch_get_on_conflict_set(const ChunkDispatch *dispatch)
 {
 	return get_modifytable(dispatch)->onConflictSet;
-}
-
-Node *
-ts_chunk_dispatch_get_on_conflict_where(const ChunkDispatch *dispatch)
-{
-	return get_modifytable(dispatch)->onConflictWhere;
 }
 
 CmdType
@@ -118,6 +116,14 @@ ts_chunk_dispatch_get_chunk_insert_state(ChunkDispatch *dispatch, Point *point,
 {
 	ChunkInsertState *cis;
 	bool cis_changed = true;
+
+	/* Direct inserts into internal compressed hypertable is not supported.
+	 * For compression chunks are created explicitly by compress_chunk and
+	 * inserted into directly so we should never end up in this code path
+	 * for a compressed hypertable.
+	 */
+	if (dispatch->hypertable->fd.compression_state == HypertableInternalCompressionTable)
+		elog(ERROR, "direct insert into internal compressed hypertable is not supported");
 
 	cis = ts_subspace_store_get(dispatch->cache, point);
 

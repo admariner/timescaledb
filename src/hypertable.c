@@ -35,18 +35,17 @@
 #include <utils/syscache.h>
 
 #include "hypertable.h"
-#include "hypertable_data_node.h"
+#include "ts_catalog/hypertable_data_node.h"
 #include "hypercube.h"
 #include "dimension.h"
 #include "chunk.h"
 #include "chunk_adaptive.h"
-#include "hypertable_compression.h"
+#include "ts_catalog/hypertable_compression.h"
 #include "subspace_store.h"
 #include "hypertable_cache.h"
 #include "trigger.h"
 #include "scanner.h"
-#include "scan_iterator.h"
-#include "catalog.h"
+#include "ts_catalog/catalog.h"
 #include "dimension_slice.h"
 #include "dimension_vector.h"
 #include "hypercube.h"
@@ -56,7 +55,7 @@
 #include "copy.h"
 #include "utils.h"
 #include "bgw_policy/policy.h"
-#include "continuous_agg.h"
+#include "ts_catalog/continuous_agg.h"
 #include "license_guc.h"
 #include "cross_module_fn.h"
 #include "scan_iterator.h"
@@ -170,8 +169,8 @@ hypertable_formdata_make_tuple(const FormData_hypertable *fd, TupleDesc desc)
 	return heap_form_tuple(desc, values, nulls);
 }
 
-static void
-hypertable_formdata_fill(FormData_hypertable *fd, const TupleInfo *ti)
+void
+ts_hypertable_formdata_fill(FormData_hypertable *fd, const TupleInfo *ti)
 {
 	bool nulls[Natts_hypertable];
 	Datum values[Natts_hypertable];
@@ -242,7 +241,7 @@ ts_hypertable_from_tupleinfo(const TupleInfo *ti)
 	Oid namespace_oid;
 	Hypertable *h = MemoryContextAllocZero(ti->mctx, sizeof(Hypertable));
 
-	hypertable_formdata_fill(&h->fd, ti);
+	ts_hypertable_formdata_fill(&h->fd, ti);
 	namespace_oid = get_namespace_oid(NameStr(h->fd.schema_name), false);
 	h->main_table_relid = get_relname_relid(NameStr(h->fd.table_name), namespace_oid);
 	h->space = ts_dimension_scan(h->fd.id, h->main_table_relid, h->fd.num_dimensions, ti->mctx);
@@ -261,7 +260,7 @@ hypertable_tuple_get_relid(TupleInfo *ti, void *data)
 	FormData_hypertable fd;
 	Oid schema_oid;
 
-	hypertable_formdata_fill(&fd, ti);
+	ts_hypertable_formdata_fill(&fd, ti);
 	schema_oid = get_namespace_oid(NameStr(fd.schema_name), true);
 
 	if (OidIsValid(schema_oid))
@@ -384,78 +383,6 @@ hypertable_scan_limit_internal(ScanKeyData *scankey, int num_scankeys, int index
 	return ts_scanner_scan(&scanctx);
 }
 
-/* Is a user hypertable without compression or continuous aggs */
-static bool
-hypertable_is_user_table(const Hypertable *ht)
-{
-	ContinuousAggHypertableStatus status = ts_continuous_agg_hypertable_status(ht->fd.id);
-
-	return (!TS_HYPERTABLE_IS_INTERNAL_COMPRESSION_TABLE(ht) &&
-			status != HypertableIsMaterialization);
-}
-
-static ScanTupleResult
-hypertable_tuple_add_stat(TupleInfo *ti, void *data)
-{
-	HypertablesStat *stat = data;
-	Hypertable *ht = ts_hypertable_from_tupleinfo(ti);
-	bool isnull;
-	Datum datum;
-
-	datum = slot_getattr(ti->slot, Anum_hypertable_replication_factor, &isnull);
-
-	if (!isnull)
-	{
-		int16 replication_factor = DatumGetInt16(datum);
-
-		switch (replication_factor)
-		{
-			case HYPERTABLE_DISTRIBUTED_MEMBER:
-				stat->num_hypertables_distributed_members++;
-				break;
-			case HYPERTABLE_REGULAR:
-				/* This should not be possible */
-				Assert(0);
-				break;
-			default:
-				Assert(replication_factor >= 1);
-				Assert(!TS_HYPERTABLE_IS_INTERNAL_COMPRESSION_TABLE(ht));
-				stat->num_hypertables_distributed++;
-				if (replication_factor > 1)
-					stat->num_hypertables_distributed_and_replicated++;
-				break;
-		}
-	}
-	else
-	{
-		/* Number of user-created hypertables (doesn't count internal hypertables
-		 * for compression or continuous aggs) */
-		if (hypertable_is_user_table(ht))
-			stat->num_hypertables_user++;
-	}
-
-	/* Number of hypertables with compression enabled */
-	if (TS_HYPERTABLE_HAS_COMPRESSION_ENABLED(ht))
-		stat->num_hypertables_compressed++;
-
-	return SCAN_CONTINUE;
-}
-
-void
-ts_number_of_hypertables(HypertablesStat *stat)
-{
-	stat->num_hypertables_total = hypertable_scan_limit_internal(NULL,
-																 0,
-																 HYPERTABLE_ID_INDEX,
-																 hypertable_tuple_add_stat,
-																 stat,
-																 -1,
-																 AccessShareLock,
-																 false,
-																 CurrentMemoryContext,
-																 NULL);
-}
-
 static ScanTupleResult
 hypertable_tuple_append(TupleInfo *ti, void *data)
 {
@@ -547,8 +474,8 @@ ts_hypertable_scan_with_memory_context(const char *schema, const char *table,
 									   bool tuplock, MemoryContext mctx)
 {
 	ScanKeyData scankey[2];
-	NameData schema_name = { 0 };
-	NameData table_name = { 0 };
+	NameData schema_name = { { 0 } };
+	NameData table_name = { { 0 } };
 
 	if (schema)
 		namestrcpy(&schema_name, schema);
@@ -722,13 +649,13 @@ ts_hypertable_delete_by_name(const char *schema_name, const char *table_name)
 				Anum_hypertable_name_idx_table,
 				BTEqualStrategyNumber,
 				F_NAMEEQ,
-				DirectFunctionCall1(namein, CStringGetDatum(table_name)));
+				CStringGetDatum(table_name));
 
 	ScanKeyInit(&scankey[1],
 				Anum_hypertable_name_idx_schema,
 				BTEqualStrategyNumber,
 				F_NAMEEQ,
-				DirectFunctionCall1(namein, CStringGetDatum(schema_name)));
+				CStringGetDatum(schema_name));
 	return hypertable_scan_limit_internal(scankey,
 										  2,
 										  HYPERTABLE_NAME_INDEX,
@@ -767,13 +694,18 @@ ts_hypertable_delete_by_id(int32 hypertable_id)
 void
 ts_hypertable_drop(Hypertable *hypertable, DropBehavior behavior)
 {
-	ObjectAddress hypertable_addr = (ObjectAddress){
-		.classId = RelationRelationId,
-		.objectId = hypertable->main_table_relid,
-	};
+	/* The actual table might have been deleted already, but we still need to
+	 * clean up the catalog entry. */
+	if (OidIsValid(hypertable->main_table_relid))
+	{
+		ObjectAddress hypertable_addr = (ObjectAddress){
+			.classId = RelationRelationId,
+			.objectId = hypertable->main_table_relid,
+		};
 
-	/* Drop the postgres table */
-	performDeletion(&hypertable_addr, behavior, 0);
+		/* Drop the postgres table */
+		performDeletion(&hypertable_addr, behavior, 0);
+	}
 	/* Clean up catalog */
 	ts_hypertable_delete_by_name(hypertable->fd.schema_name.data, hypertable->fd.table_name.data);
 }
@@ -785,7 +717,7 @@ reset_associated_tuple_found(TupleInfo *ti, void *data)
 	FormData_hypertable fd;
 	CatalogSecurityContext sec_ctx;
 
-	hypertable_formdata_fill(&fd, ti);
+	ts_hypertable_formdata_fill(&fd, ti);
 	namestrcpy(&fd.associated_schema_name, INTERNAL_SCHEMA_NAME);
 	new_tuple = hypertable_formdata_make_tuple(&fd, ts_scanner_get_tupledesc(ti));
 	ts_catalog_database_info_become_owner(ts_catalog_database_info_get(), &sec_ctx);
@@ -808,7 +740,7 @@ ts_hypertable_reset_associated_schema_name(const char *associated_schema)
 				Anum_hypertable_associated_schema_name,
 				BTEqualStrategyNumber,
 				F_NAMEEQ,
-				DirectFunctionCall1(namein, CStringGetDatum(associated_schema)));
+				CStringGetDatum(associated_schema));
 
 	return hypertable_scan_limit_internal(scankey,
 										  1,
@@ -1037,22 +969,27 @@ ts_hypertable_get_by_name(const char *schema, const char *name)
 	return ht;
 }
 
-static void
-hypertable_scan_by_name(ScanIterator *iterator, const char *schema, const char *name)
+void
+ts_hypertable_scan_by_name(ScanIterator *iterator, const char *schema, const char *name)
 {
 	iterator->ctx.index = catalog_get_index(ts_catalog_get(), HYPERTABLE, HYPERTABLE_NAME_INDEX);
 
-	ts_scan_iterator_scan_key_init(iterator,
-								   Anum_hypertable_name_idx_table,
-								   BTEqualStrategyNumber,
-								   F_NAMEEQ,
-								   CStringGetDatum(name));
+	/* both cannot be NULL inputs */
+	Assert(name != NULL || schema != NULL);
 
-	ts_scan_iterator_scan_key_init(iterator,
-								   Anum_hypertable_name_idx_schema,
-								   BTEqualStrategyNumber,
-								   F_NAMEEQ,
-								   CStringGetDatum(schema));
+	if (name)
+		ts_scan_iterator_scan_key_init(iterator,
+									   Anum_hypertable_name_idx_table,
+									   BTEqualStrategyNumber,
+									   F_NAMEEQ,
+									   CStringGetDatum(name));
+
+	if (schema)
+		ts_scan_iterator_scan_key_init(iterator,
+									   Anum_hypertable_name_idx_schema,
+									   BTEqualStrategyNumber,
+									   F_NAMEEQ,
+									   CStringGetDatum(schema));
 }
 
 /*
@@ -1070,11 +1007,11 @@ ts_hypertable_get_attributes_by_name(const char *schema, const char *name,
 	ScanIterator iterator =
 		ts_scan_iterator_create(HYPERTABLE, AccessShareLock, CurrentMemoryContext);
 
-	hypertable_scan_by_name(&iterator, schema, name);
+	ts_hypertable_scan_by_name(&iterator, schema, name);
 	ts_scanner_foreach(&iterator)
 	{
 		TupleInfo *ti = ts_scan_iterator_tuple_info(&iterator);
-		hypertable_formdata_fill(form, ti);
+		ts_hypertable_formdata_fill(form, ti);
 		ts_scan_iterator_close(&iterator);
 		return true;
 	}
@@ -1763,11 +1700,11 @@ ts_validate_replication_factor(int32 replication_factor, bool is_null, bool is_d
 			 * Special replication_factor case for hypertables created on remote
 			 * data nodes. Used to distinguish them from regular hypertables.
 			 *
-			 * Such argument is only allowed to be use by frontend session.
+			 * Such argument is only allowed to be use by access node session.
 			 */
 			if (replication_factor == -1)
-				valid =
-					ts_cm_functions->is_frontend_session && ts_cm_functions->is_frontend_session();
+				valid = ts_cm_functions->is_access_node_session &&
+						ts_cm_functions->is_access_node_session();
 		}
 	}
 
@@ -2218,7 +2155,7 @@ ts_hypertable_create_from_info(Oid table_relid, int32 hypertable_id, uint32 flag
 				(errmsg("migrating data to chunks"),
 				 errdetail("Migration might take a while depending on the amount of data.")));
 
-		timescaledb_move_from_table_to_chunks(ht, AccessShareLock);
+		timescaledb_move_from_table_to_chunks(ht, RowExclusiveLock);
 	}
 
 	insert_blocker_trigger_add(table_relid);
@@ -2250,7 +2187,7 @@ hypertable_rename_schema_name(TupleInfo *ti, void *data)
 	bool updated = false;
 	FormData_hypertable fd;
 
-	hypertable_formdata_fill(&fd, ti);
+	ts_hypertable_formdata_fill(&fd, ti);
 
 	/*
 	 * Because we are doing a heap scan with no scankey, we don't know which
@@ -2386,6 +2323,11 @@ ts_hypertable_set_integer_now_func(PG_FUNCTION_ARGS)
 
 	ts_hypertable_permissions_check(table_relid, GetUserId());
 	hypertable = ts_hypertable_cache_get_cache_and_entry(table_relid, CACHE_FLAG_NONE, &hcache);
+
+	if (TS_HYPERTABLE_IS_INTERNAL_COMPRESSION_TABLE(hypertable))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("custom time function not supported on internal compression table")));
 
 	/* validate that the open dimension uses numeric type */
 	open_dim = hyperspace_get_open_dimension(hypertable->space, 0);

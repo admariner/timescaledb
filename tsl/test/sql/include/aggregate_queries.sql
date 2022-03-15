@@ -40,16 +40,16 @@
    last(temperature, timec) as last_temp,
    histogram(temperature, 0, 100, 1)
   FROM :TEST_TABLE
-  GROUP BY :GROUPING
-  ORDER BY :GROUPING;
+  GROUP BY :GROUPING, timec
+  ORDER BY :GROUPING, timec;
 
 -- Aggregates on custom types are not yet pushed down
 :PREFIX SELECT :GROUPING,
    last(highlow, timec) as last_hl,
    first(highlow, timec) as first_hl
   FROM :TEST_TABLE
-  GROUP BY :GROUPING
-  ORDER BY :GROUPING;
+  GROUP BY :GROUPING, timec
+  ORDER BY :GROUPING, timec;
 
 -- Mix of aggregates that push down and those that don't
 :PREFIX SELECT :GROUPING,
@@ -65,5 +65,20 @@
    bool_or(good_life),
    first(highlow, timec) as first_hl
   FROM :TEST_TABLE
-  GROUP BY :GROUPING
-  ORDER BY :GROUPING;
+  GROUP BY :GROUPING, timec
+  ORDER BY :GROUPING, timec;
+
+-- Aggregates nested in expressions and no top-level aggregate #3672
+:PREFIX SELECT :GROUPING,
+  sum(temperature)+sum(humidity) as agg_sum_expr
+  FROM :TEST_TABLE
+  GROUP BY :GROUPING, timec
+  ORDER BY :GROUPING, timec;
+
+-- Aggregates with no aggregate reference in targetlist #3664
+:PREFIX SELECT :GROUPING
+  FROM :TEST_TABLE
+  GROUP BY :GROUPING, timec
+  HAVING avg(temperature) > 20
+  ORDER BY :GROUPING, timec;
+

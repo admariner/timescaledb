@@ -17,6 +17,7 @@
 #include <commands/cluster.h>
 #include <commands/defrem.h>
 #include <commands/tablecmds.h>
+#include <commands/tablespace.h>
 #include <miscadmin.h>
 #include <nodes/parsenodes.h>
 #include <optimizer/optimizer.h>
@@ -29,7 +30,7 @@
 #include "chunk_index.h"
 #include "hypertable.h"
 #include "hypertable_cache.h"
-#include "catalog.h"
+#include "ts_catalog/catalog.h"
 #include "scanner.h"
 #include "scan_iterator.h"
 #include "chunk.h"
@@ -107,7 +108,11 @@ adjust_expr_attnos(Oid ht_relid, IndexInfo *ii, Relation chunkrel)
 
 		char *attname = get_attname(ht_relid, var->varattno, false);
 		var->varattno = get_attnum(chunkrel->rd_id, attname);
-
+#if PG13_GE
+		var->varattnosyn = var->varattno;
+#else
+		var->varoattno = var->varattno;
+#endif
 		if (var->varattno == InvalidAttrNumber)
 			elog(ERROR, "index attribute %s not found in chunk", attname);
 	}
@@ -207,12 +212,24 @@ chunk_relation_index_create(Relation htrel, Relation template_indexrel, Relation
 {
 	IndexInfo *indexinfo = BuildIndexInfo(template_indexrel);
 	int32 hypertable_id;
+	bool skip_mapping = false;
+
+	/*
+	 * If the supplied template index is not on the hypertable we must not do attnum
+	 * mapping based on the hypertable. Ideally we would check for the template being
+	 * on the chunk but we cannot do that since when we rebuild a chunk the new chunk
+	 * has a different id. But the template index should always be either on the
+	 * hypertable or on a relation with the same physical layout as chunkrel.
+	 */
+	if (IndexGetRelation(template_indexrel->rd_id, false) != htrel->rd_id)
+		skip_mapping = true;
 
 	/*
 	 * Convert the IndexInfo's attnos to match the chunk instead of the
 	 * hypertable
 	 */
-	if (chunk_index_need_attnos_adjustment(RelationGetDescr(htrel), RelationGetDescr(chunkrel)))
+	if (!skip_mapping &&
+		chunk_index_need_attnos_adjustment(RelationGetDescr(htrel), RelationGetDescr(chunkrel)))
 		ts_adjust_indexinfo_attnos(indexinfo, htrel->rd_id, chunkrel);
 
 	hypertable_id = ts_hypertable_relid_to_id(htrel->rd_id);
@@ -364,7 +381,7 @@ ts_chunk_index_create_from_constraint(int32 hypertable_id, Oid hypertable_constr
  */
 static void
 chunk_index_create(Relation hypertable_rel, int32 hypertable_id, Relation hypertable_idxrel,
-				   int32 chunk_id, Relation chunkrel, Oid constraint_oid)
+				   int32 chunk_id, Relation chunkrel, Oid constraint_oid, Oid index_tblspc)
 {
 	Oid chunk_indexrelid;
 
@@ -377,8 +394,11 @@ chunk_index_create(Relation hypertable_rel, int32 hypertable_id, Relation hypert
 		return;
 	}
 
-	chunk_indexrelid =
-		chunk_relation_index_create(hypertable_rel, hypertable_idxrel, chunkrel, false, InvalidOid);
+	chunk_indexrelid = chunk_relation_index_create(hypertable_rel,
+												   hypertable_idxrel,
+												   chunkrel,
+												   false,
+												   index_tblspc);
 
 	chunk_index_insert(chunk_id,
 					   get_rel_name(chunk_indexrelid),
@@ -409,7 +429,8 @@ ts_chunk_index_create_from_adjusted_index_info(int32 hypertable_id, Relation hyp
  * hypertable.
  */
 void
-ts_chunk_index_create_all(int32 hypertable_id, Oid hypertable_relid, int32 chunk_id, Oid chunkrelid)
+ts_chunk_index_create_all(int32 hypertable_id, Oid hypertable_relid, int32 chunk_id, Oid chunkrelid,
+						  Oid index_tblspc)
 {
 	Relation htrel;
 	Relation chunkrel;
@@ -451,7 +472,8 @@ ts_chunk_index_create_all(int32 hypertable_id, Oid hypertable_relid, int32 chunk
 						   hypertable_idxrel,
 						   chunk_id,
 						   chunkrel,
-						   get_index_constraint(hypertable_idxoid));
+						   get_index_constraint(hypertable_idxoid),
+						   index_tblspc);
 
 		index_close(hypertable_idxrel, AccessShareLock);
 	}
@@ -539,7 +561,7 @@ ts_chunk_index_get_mappings(Hypertable *ht, Oid hypertable_indexrelid)
 				Anum_chunk_index_hypertable_id_hypertable_index_name_idx_hypertable_index_name,
 				BTEqualStrategyNumber,
 				F_NAMEEQ,
-				DirectFunctionCall1(namein, CStringGetDatum((indexname))));
+				CStringGetDatum((indexname)));
 
 	chunk_index_scan(CHUNK_INDEX_HYPERTABLE_ID_HYPERTABLE_INDEX_NAME_IDX,
 					 scankey,
@@ -713,7 +735,7 @@ ts_chunk_index_delete(int32 chunk_id, const char *indexname, bool drop_index)
 				Anum_chunk_index_chunk_id_index_name_idx_index_name,
 				BTEqualStrategyNumber,
 				F_NAMEEQ,
-				DirectFunctionCall1(namein, CStringGetDatum(indexname)));
+				CStringGetDatum(indexname));
 
 	return chunk_index_scan_update(CHUNK_INDEX_CHUNK_ID_INDEX_NAME_IDX,
 								   scankey,
@@ -789,7 +811,7 @@ ts_chunk_index_get_by_indexrelid(Chunk *chunk, Oid chunk_indexrelid, ChunkIndexM
 				Anum_chunk_index_chunk_id_index_name_idx_index_name,
 				BTEqualStrategyNumber,
 				F_NAMEEQ,
-				DirectFunctionCall1(namein, CStringGetDatum(indexname)));
+				CStringGetDatum(indexname));
 
 	tuples_found = chunk_index_scan(CHUNK_INDEX_CHUNK_ID_INDEX_NAME_IDX,
 									scankey,
@@ -1244,4 +1266,35 @@ ts_chunk_index_replace(PG_FUNCTION_ARGS)
 	RenameRelationInternal(chunk_index_oid_new, name, false, true);
 
 	PG_RETURN_VOID();
+}
+
+void
+ts_chunk_index_move_all(Oid chunk_relid, Oid index_tblspc)
+{
+	Relation chunkrel;
+	List *indexlist;
+	ListCell *lc;
+	const char chunk_relkind = get_rel_relkind(chunk_relid);
+
+	/* execute ALTER INDEX .. SET TABLESPACE for each index on the chunk */
+	AlterTableCmd cmd = { .type = T_AlterTableCmd,
+						  .subtype = AT_SetTableSpace,
+						  .name = get_tablespace_name(index_tblspc) };
+
+	/* Foreign table chunks don't support indexes */
+	if (chunk_relkind == RELKIND_FOREIGN_TABLE)
+		return;
+
+	Assert(chunk_relkind == RELKIND_RELATION);
+
+	chunkrel = table_open(chunk_relid, AccessShareLock);
+
+	indexlist = RelationGetIndexList(chunkrel);
+
+	foreach (lc, indexlist)
+	{
+		Oid chunk_idxoid = lfirst_oid(lc);
+		AlterTableInternal(chunk_idxoid, list_make1(&cmd), false);
+	}
+	table_close(chunkrel, AccessShareLock);
 }

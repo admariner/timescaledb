@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: ["12.7", "13.3"]
+        pg: ["12.10", "13.6", "14.2"]
         os: [ubuntu-20.04]
     env:
       PG_SRC_DIR: pgbuild
@@ -55,7 +55,7 @@ jobs:
     - name: Build TimescaleDB
       run: |
         PATH="$GITHUB_WORKSPACE/coverity/bin:$PATH"
-        ./bootstrap -DCMAKE_BUILD_TYPE=Release -DPG_SOURCE_DIR=~/$PG_SRC_DIR -DPG_PATH=~/$PG_INSTALL_DIR -DTAP_CHECKS=off
+        ./bootstrap -DCMAKE_BUILD_TYPE=Release -DPG_SOURCE_DIR=~/$PG_SRC_DIR -DPG_PATH=~/$PG_INSTALL_DIR
         cov-build --dir cov-int make -C build
 
     - name: Upload report

@@ -15,6 +15,10 @@ CREATE OR REPLACE FUNCTION test.remote_exec(srv_name name[], command text)
 RETURNS VOID
 AS :TSL_MODULE_PATHNAME, 'ts_remote_exec'
 LANGUAGE C;
+CREATE OR REPLACE FUNCTION test.remote_exec_get_result_strings(srv_name name[], command text)
+RETURNS TABLE("table_record" CSTRING[])
+AS :TSL_MODULE_PATHNAME, 'ts_remote_exec_get_result_strings'
+LANGUAGE C;
 GRANT CREATE ON DATABASE :"TEST_DBNAME" TO :ROLE_DEFAULT_PERM_USER;
 SET ROLE :ROLE_DEFAULT_PERM_USER;
 CREATE SCHEMA "ChunkSchema";
@@ -552,7 +556,6 @@ _timescaledb_internal._dist_hyper_2_5_chunk|        4|f         |          0|   
 -- Clean up
 RESET ROLE;
 TRUNCATE disttable;
-TRUNCATE costtable;
 SELECT * FROM delete_data_node('data_node_1', force => true);
 WARNING:  insufficient number of data nodes for distributed hypertable "disttable"
 NOTICE:  the number of partitions in dimension "device" was decreased to 1

@@ -1,5 +1,12 @@
-set(SOURCES adt_tests.c symbol_conflict.c test_time_to_internal.c
-            test_with_clause_parser.c test_time_utils.c test_utils.c)
+set(SOURCES
+    metadata.c
+    adt_tests.c
+    symbol_conflict.c
+    test_time_to_internal.c
+    test_with_clause_parser.c
+    test_time_utils.c
+    test_utils.c
+    test_scanner.c)
 
 include(${PROJECT_SOURCE_DIR}/src/build-defs.cmake)
 
@@ -17,6 +24,8 @@ target_include_directories(${TESTS_LIB_NAME}
 
 add_subdirectory(bgw)
 add_subdirectory(net)
-add_subdirectory(telemetry)
+if(USE_TELEMETRY)
+  add_subdirectory(telemetry)
+endif()
 
 add_subdirectory(loader)

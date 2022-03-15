@@ -27,11 +27,29 @@ set(MOD_FILES
     updates/2.2.0--2.2.1.sql
     updates/2.2.1--2.3.0.sql
     updates/2.3.0--2.3.1.sql
-    updates/2.3.1--2.4.0.sql)
+    updates/2.3.1--2.4.0.sql
+    updates/2.4.0--2.4.1.sql
+    updates/2.4.1--2.4.2.sql
+    updates/2.4.2--2.5.0.sql
+    updates/2.5.0--2.5.1.sql
+    updates/2.5.1--2.5.2.sql
+    updates/2.5.2--2.6.0.sql)
 
-# Files for downgrade scripts. This should only include files for downgrade to
-# previous version since we do not support skipping versions when downgrading
-set(REV_FILES)
+# The downgrade file to generate a downgrade script for the current version, as
+# specified in version.config
+set(CURRENT_REV_FILE reverse-dev.sql)
+# Files for generating old downgrade scripts. This should only include files for
+# downgrade to from one version to its previous version since we do not support
+# skipping versions when downgrading.
+set(OLD_REV_FILES
+    2.3.1--2.3.0.sql
+    2.4.0--2.3.1.sql
+    2.4.1--2.4.0.sql
+    2.4.2--2.4.1.sql
+    2.5.0--2.4.2.sql
+    2.5.1--2.5.0.sql
+    2.5.2--2.5.1.sql
+    2.6.0--2.5.2.sql)
 
 set(MODULE_PATHNAME "$libdir/timescaledb-${PROJECT_VERSION_MOD}")
 set(LOADER_PATHNAME "$libdir/timescaledb")
@@ -54,25 +72,27 @@ else()
     INPUT_DIRECTORY
     ${CMAKE_CURRENT_SOURCE_DIR}/updates
     FILES
-    reverse-dev.sql)
-  foreach(_downgrade_file ${REV_FILES})
-    if(${_downgrade_file} MATCHES
-       "([0-9]+\\.[0-9]+\\.*[0-9]*)--([0-9]+\\.[0-9]+\\.*[0-9]*).sql")
-      set(_source_version ${CMAKE_MATCH_1})
-      set(_target_version ${CMAKE_MATCH_2})
-      generate_downgrade_script(
-        SOURCE_VERSION
-        ${_source_version}
-        TARGET_VERSION
-        ${_target_version}
-        INPUT_DIRECTORY
-        ${CMAKE_CURRENT_SOURCE_DIR}/updates
-        FILES
-        ${_downgrade_file})
-    else()
-      message(FATAL_ERROR "${_downgrade_file} is not a downgrade file")
-    endif()
-  endforeach()
+    ${CURRENT_REV_FILE})
+  if(GENERATE_OLD_DOWNGRADE_SCRIPTS)
+    foreach(_downgrade_file ${OLD_REV_FILES})
+      if(${_downgrade_file} MATCHES
+         "([0-9]+\\.[0-9]+\\.*[0-9]*)--([0-9]+\\.[0-9]+\\.*[0-9]*).sql")
+        set(_source_version ${CMAKE_MATCH_1})
+        set(_target_version ${CMAKE_MATCH_2})
+        generate_downgrade_script(
+          SOURCE_VERSION
+          ${_source_version}
+          TARGET_VERSION
+          ${_target_version}
+          INPUT_DIRECTORY
+          ${CMAKE_CURRENT_SOURCE_DIR}/updates
+          FILES
+          ${_downgrade_file})
+      else()
+        message(FATAL_ERROR "${_downgrade_file} is not a downgrade file")
+      endif()
+    endforeach()
+  endif()
 endif()
 
 # Function to replace @MODULE_PATHNAME@ in source files, producing an output
@@ -96,6 +116,8 @@ endfunction()
 version_files("${PRE_UPDATE_FILES}" PRE_UPDATE_FILES_VERSIONED)
 version_files("${POST_UPDATE_FILES}" POST_UPDATE_FILES_VERSIONED)
 version_files("${PRE_INSTALL_SOURCE_FILES}" PRE_INSTALL_SOURCE_FILES_VERSIONED)
+version_files("${PRE_INSTALL_FUNCTION_FILES}"
+              PRE_INSTALL_FUNCTION_FILES_VERSIONED)
 version_files("${SOURCE_FILES}" SOURCE_FILES_VERSIONED)
 version_files("${MOD_FILES}" MOD_FILES_VERSIONED)
 version_files("updates/latest-dev.sql" LASTEST_MOD_VERSIONED)
@@ -104,25 +126,49 @@ version_files("notice.sql" NOTICE_FILE)
 # Function to concatenate all files in SRC_FILE_LIST into file OUTPUT_FILE
 function(cat_files SRC_FILE_LIST OUTPUT_FILE)
   if(WIN32)
-    # Make list of files into string of files separated by "+" to make Windows
-    # copy concatenate them
-    file(TO_NATIVE_PATH "${SRC_FILE_LIST}" SRC_FILE_LIST_NATIVE)
-    string(REPLACE ";" ";+;" SQL_LIST_JOINED "${SRC_FILE_LIST_NATIVE}")
-    file(TO_NATIVE_PATH "${OUTPUT_FILE}" OUTPUT_FILE_NATIVE)
-    set(CAT_CMD copy /B /y ${SQL_LIST_JOINED} "\"${OUTPUT_FILE_NATIVE}\"" >NUL)
+    set("SRC_ARG" "-DSRC_FILE_LIST=${SRC_FILE_LIST}")
   else()
-    set(CAT_CMD cat ${SRC_FILE_LIST} > ${OUTPUT_FILE})
+    set("SRC_ARG" "'-DSRC_FILE_LIST=${SRC_FILE_LIST}'")
   endif()
   add_custom_command(
     OUTPUT ${OUTPUT_FILE}
     DEPENDS ${SRC_FILE_LIST}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    COMMAND ${CAT_CMD}
+    COMMAND ${CMAKE_COMMAND} "${SRC_ARG}" "-DOUTPUT_FILE=${OUTPUT_FILE}" -P
+            cat.cmake
     COMMENT "Generating ${OUTPUT_FILE}")
 endfunction()
 
+# Concatenate all files in SRC_FILE_LIST into file OUTPUT_FILE Additionally
+# strips out `OR REPLACE` from the generated file as this would allow a
+# privilege escalation attack when present in the CREATE script
+function(cat_create_files SRC_FILE_LIST OUTPUT_FILE)
+  if(WIN32)
+    set("SRC_ARG" "-DSRC_FILE_LIST=${SRC_FILE_LIST}")
+  else()
+    set("SRC_ARG" "'-DSRC_FILE_LIST=${SRC_FILE_LIST}'")
+  endif()
+  if(WIN32)
+    add_custom_command(
+      OUTPUT ${OUTPUT_FILE}
+      DEPENDS ${SRC_FILE_LIST}
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      COMMAND ${CMAKE_COMMAND} "${SRC_ARG}" "-DOUTPUT_FILE=${OUTPUT_FILE}"
+              "-DSTRIP_REPLACE=ON" -P cat.cmake
+      COMMENT "Generating ${OUTPUT_FILE}")
+  else()
+    add_custom_command(
+      OUTPUT ${OUTPUT_FILE}
+      DEPENDS ${SRC_FILE_LIST}
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      COMMAND ${CMAKE_COMMAND} "'-DSRC_FILE_LIST=${SRC_FILE_LIST}'"
+              "-DOUTPUT_FILE=${OUTPUT_FILE}" "-DSTRIP_REPLACE=ON" -P cat.cmake
+      COMMENT "Generating ${OUTPUT_FILE}")
+  endif()
+endfunction()
+
 # Generate the extension file used with CREATE EXTENSION
-cat_files(
+cat_create_files(
   "${PRE_INSTALL_SOURCE_FILES_VERSIONED};${SOURCE_FILES_VERSIONED};${NOTICE_FILE}"
   ${CMAKE_CURRENT_BINARY_DIR}/${INSTALL_FILE})
 add_custom_target(sqlfile ALL
@@ -189,11 +235,12 @@ foreach(transition_mod_file ${MOD_FILES_LIST})
   list(APPEND UPDATE_SCRIPTS ${UPDATE_SCRIPT})
   if(CURR_MOD_FILES)
     cat_files(
-      "${PRE_FILES};${CURR_MOD_FILES};${SOURCE_FILES_VERSIONED};${POST_FILES_PROCESSED}"
+      "${PRE_FILES};${CURR_MOD_FILES};${PRE_INSTALL_FUNCTION_FILES_VERSIONED};${SOURCE_FILES_VERSIONED};${POST_FILES_PROCESSED}"
       ${UPDATE_SCRIPT})
   else()
-    cat_files("${PRE_FILES};${SOURCE_FILES_VERSIONED};${POST_FILES_PROCESSED}"
-              ${UPDATE_SCRIPT})
+    cat_files(
+      "${PRE_FILES};${PRE_INSTALL_FUNCTION_FILES_VERSIONED};${SOURCE_FILES_VERSIONED};${POST_FILES_PROCESSED}"
+      ${UPDATE_SCRIPT})
   endif()
 endforeach(transition_mod_file)
 

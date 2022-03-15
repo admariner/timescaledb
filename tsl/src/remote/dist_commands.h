@@ -6,17 +6,28 @@
 #ifndef TIMESCALEDB_TSL_REMOTE_DIST_COMMANDS_H
 #define TIMESCALEDB_TSL_REMOTE_DIST_COMMANDS_H
 
-#include <catalog.h>
+#include "ts_catalog/catalog.h"
 
 #include "async.h"
 
 typedef struct DistCmdResult DistCmdResult;
 typedef struct List PreparedDistCmd;
+typedef struct DistCmdDescr
+{
+	const char *sql;
+	StmtParams *params;
 
+} DistCmdDescr;
+
+extern DistCmdResult *ts_dist_multi_cmds_params_invoke_on_data_nodes(List *cmd_descriptors,
+																	 List *data_nodes,
+																	 bool transactional);
 extern DistCmdResult *ts_dist_cmd_invoke_on_data_nodes(const char *sql, List *node_names,
 													   bool transactional);
 extern DistCmdResult *ts_dist_cmd_params_invoke_on_data_nodes(const char *sql, StmtParams *params,
 															  List *data_nodes, bool transactional);
+extern DistCmdResult *ts_dist_multi_cmds_invoke_on_data_nodes_using_search_path(
+	List *cmd_descriptors, const char *search_path, List *node_names, bool transactional);
 extern DistCmdResult *ts_dist_cmd_invoke_on_data_nodes_using_search_path(const char *sql,
 																		 const char *search_path,
 																		 List *node_names,

@@ -1,19 +1,17 @@
 set(SOURCES
+    uuid.c
     agg_bookend.c
     func_cache.c
     cache.c
     cache_invalidate.c
-    catalog.c
-    continuous_agg.c
     chunk.c
     chunk_adaptive.c
     chunk_constraint.c
     chunk_index.c
-    chunk_data_node.c
+    chunk_scan.c
     constraint.c
     cross_module_fn.c
     copy.c
-    compression_chunk_size.c
     compression_with_clause.c
     dimension.c
     dimension_slice.c
@@ -21,18 +19,16 @@ set(SOURCES
     estimate.c
     event_trigger.c
     extension.c
+    extension_constants.c
     gapfill.c
     guc.c
     histogram.c
     hypercube.c
     hypertable.c
     hypertable_cache.c
-    hypertable_compression.c
     hypertable_restrict_info.c
-    hypertable_data_node.c
     indexing.c
     init.c
-    metadata.c
     jsonb_utils.c
     license_guc.c
     partitioning.c
@@ -46,7 +42,7 @@ set(SOURCES
     scan_iterator.c
     sort_transform.c
     subspace_store.c
-    tablespace.c
+    timezones.c
     time_bucket.c
     time_utils.c
     custom_type_cache.c
@@ -73,10 +69,12 @@ else()
   add_library(${PROJECT_NAME} MODULE ${SOURCES} ${GITCOMMIT_H})
 endif()
 
-if(SEND_TELEMETRY_DEFAULT)
-  set(TELEMETRY_DEFAULT TELEMETRY_BASIC)
-else()
-  set(TELEMETRY_DEFAULT TELEMETRY_OFF)
+if(USE_TELEMETRY)
+  if(SEND_TELEMETRY_DEFAULT)
+    set(TELEMETRY_DEFAULT TELEMETRY_BASIC)
+  else()
+    set(TELEMETRY_DEFAULT TELEMETRY_OFF)
+  endif()
 endif()
 
 set_target_properties(
@@ -96,11 +94,13 @@ configure_file(config.h.in config.h)
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 add_subdirectory(bgw)
-add_subdirectory(chunk_append)
 add_subdirectory(net)
-add_subdirectory(telemetry)
+if(USE_TELEMETRY)
+  add_subdirectory(telemetry)
+endif()
 add_subdirectory(loader)
 add_subdirectory(bgw_policy)
 add_subdirectory(compat)
+add_subdirectory(ts_catalog)
 add_subdirectory(import)
 add_subdirectory(nodes)

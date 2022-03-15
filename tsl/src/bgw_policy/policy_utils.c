@@ -6,8 +6,11 @@
 
 #include <postgres.h>
 #include <utils/builtins.h>
+#include "ts_catalog/continuous_agg.h"
 #include "dimension.h"
+#include "errors.h"
 #include "guc.h"
+#include "hypertable.h"
 #include "jsonb_utils.h"
 #include "policy_utils.h"
 #include "time_utils.h"
@@ -66,48 +69,6 @@ policy_config_check_hypertable_lag_equality(Jsonb *config, const char *json_labe
 	}
 }
 
-int64
-subtract_integer_from_now(int64 interval, Oid time_dim_type, Oid now_func)
-{
-	Datum now;
-	int64 res;
-
-	AssertArg(IS_INTEGER_TYPE(time_dim_type));
-
-	now = OidFunctionCall0(now_func);
-
-	switch (time_dim_type)
-	{
-		case INT2OID:
-			res = DatumGetInt16(now) - interval;
-			if (res < PG_INT16_MIN || res > PG_INT16_MAX)
-				ereport(ERROR,
-						(errcode(ERRCODE_INTERVAL_FIELD_OVERFLOW),
-						 errmsg("integer time overflow")));
-			return res;
-		case INT4OID:
-			res = DatumGetInt32(now) - interval;
-			if (res < PG_INT32_MIN || res > PG_INT32_MAX)
-				ereport(ERROR,
-						(errcode(ERRCODE_INTERVAL_FIELD_OVERFLOW),
-						 errmsg("integer time overflow")));
-			return res;
-		case INT8OID:
-		{
-			bool overflow = pg_sub_s64_overflow(DatumGetInt64(now), interval, &res);
-			if (overflow)
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_INTERVAL_FIELD_OVERFLOW),
-						 errmsg("integer time overflow")));
-			}
-			return res;
-		}
-		default:
-			pg_unreachable();
-	}
-}
-
 Datum
 subtract_interval_from_now(Interval *lag, Oid time_dim_type)
 {
@@ -141,4 +102,33 @@ subtract_interval_from_now(Interval *lag, Oid time_dim_type)
 					 errmsg("unsupported time type %s", format_type_be(time_dim_type))));
 			pg_unreachable();
 	}
+}
+
+const Dimension *
+get_open_dimension_for_hypertable(const Hypertable *ht)
+{
+	int32 mat_id = ht->fd.id;
+
+	if (TS_HYPERTABLE_IS_INTERNAL_COMPRESSION_TABLE(ht))
+		elog(ERROR, "invalid operation on compressed hypertable");
+
+	const Dimension *open_dim = hyperspace_get_open_dimension(ht->space, 0);
+	Oid partitioning_type = ts_dimension_get_partition_type(open_dim);
+	if (IS_INTEGER_TYPE(partitioning_type))
+	{
+		/* if this a materialization hypertable related to cont agg
+		 * then need to get the right dimension which has
+		 * integer_now function
+		 */
+
+		open_dim = ts_continuous_agg_find_integer_now_func_by_materialization_id(mat_id);
+		if (open_dim == NULL)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_TS_UNEXPECTED),
+					 errmsg("missing integer_now function for hypertable \"%s\" ",
+							get_rel_name(ht->main_table_relid))));
+		}
+	}
+	return open_dim;
 }

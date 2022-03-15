@@ -58,6 +58,7 @@
 #include <optimizer/appendinfo.h>
 #include <optimizer/clauses.h>
 #include <optimizer/optimizer.h>
+#include <optimizer/paths.h>
 #include <optimizer/prep.h>
 #include <optimizer/tlist.h>
 #include <parser/parsetree.h>
@@ -96,15 +97,13 @@ typedef struct foreign_glob_cxt
  */
 typedef struct deparse_expr_cxt
 {
-	PlannerInfo *root;		 /* global planner state */
-	RelOptInfo *foreignrel;  /* the foreign relation we are planning for */
-	RelOptInfo *scanrel;	 /* the underlying scan relation. Same as
-							  * foreignrel, when that represents a join or
-							  * a base relation. */
-	StringInfo buf;			 /* output buffer to append to */
-	List **params_list;		 /* exprs that will become remote Params */
-	List **current_time_idx; /* locations in the sql output that need to
-							  * have the current time appended */
+	PlannerInfo *root;		/* global planner state */
+	RelOptInfo *foreignrel; /* the foreign relation we are planning for */
+	RelOptInfo *scanrel;	/* the underlying scan relation. Same as
+							 * foreignrel, when that represents a join or
+							 * a base relation. */
+	StringInfo buf;			/* output buffer to append to */
+	List **params_list;		/* exprs that will become remote Params */
 	DataNodeChunkAssignment *sca;
 } deparse_expr_cxt;
 
@@ -116,27 +115,66 @@ typedef struct deparse_expr_cxt
 
 /* Oids of mutable functions determined to safe to pushdown to data nodes */
 static Oid PushdownSafeFunctionOIDs[] = {
-	F_TIMESTAMPTZ_PL_INTERVAL,
-	F_TIMESTAMPTZ_MI_INTERVAL,
+	F_DATE_CMP_TIMESTAMPTZ,
+	F_DATE_IN,
+	F_DATE_OUT,
+	F_INTERVAL_IN,
+	F_INTERVAL_PL,
 	F_NOW, /* Special case, this will be evaluated prior to pushdown */
-	F_TIMESTAMPTZ_TIMESTAMP,
-	F_TIMESTAMP_TIMESTAMPTZ,
-	F_TIMESTAMP_PL_INTERVAL,
-	F_TIMESTAMP_MI_INTERVAL,
-	F_TIMESTAMP_LT_TIMESTAMPTZ,
-	F_TIMESTAMP_LE_TIMESTAMPTZ,
-	F_TIMESTAMP_EQ_TIMESTAMPTZ,
-	F_TIMESTAMP_GT_TIMESTAMPTZ,
-	F_TIMESTAMP_GE_TIMESTAMPTZ,
-	F_TIMESTAMP_NE_TIMESTAMPTZ,
-	F_TIMESTAMP_CMP_TIMESTAMPTZ,
-	F_TIMESTAMPTZ_LT_TIMESTAMP,
-	F_TIMESTAMPTZ_LE_TIMESTAMP,
-	F_TIMESTAMPTZ_EQ_TIMESTAMP,
-	F_TIMESTAMPTZ_GT_TIMESTAMP,
-	F_TIMESTAMPTZ_GE_TIMESTAMP,
-	F_TIMESTAMPTZ_NE_TIMESTAMP,
+	F_TIMESTAMPTZ_CMP_DATE,
 	F_TIMESTAMPTZ_CMP_TIMESTAMP,
+	F_TIMESTAMPTZ_DATE,
+	F_TIMESTAMPTZ_EQ_DATE,
+	F_TIMESTAMPTZ_EQ_TIMESTAMP,
+	F_TIMESTAMPTZ_GE_DATE,
+	F_TIMESTAMPTZ_GE_TIMESTAMP,
+	F_TIMESTAMPTZ_GT_DATE,
+	F_TIMESTAMPTZ_GT_TIMESTAMP,
+	F_TIMESTAMPTZ_IN,
+	F_TIMESTAMPTZ_LE_DATE,
+	F_TIMESTAMPTZ_LE_TIMESTAMP,
+	F_TIMESTAMPTZ_LT_DATE,
+	F_TIMESTAMPTZ_LT_TIMESTAMP,
+	F_TIMESTAMPTZ_MI_INTERVAL,
+	F_TIMESTAMPTZ_NE_DATE,
+	F_TIMESTAMPTZ_NE_TIMESTAMP,
+	F_TIMESTAMPTZ_OUT,
+	F_TIMESTAMPTZ_PL_INTERVAL,
+	F_TIMESTAMPTZ_TIMESTAMP,
+	F_TIMESTAMP_CMP_TIMESTAMPTZ,
+	F_TIMESTAMP_EQ_TIMESTAMPTZ,
+	F_TIMESTAMP_GE_TIMESTAMPTZ,
+	F_TIMESTAMP_GT_TIMESTAMPTZ,
+	F_TIMESTAMP_LE_TIMESTAMPTZ,
+	F_TIMESTAMP_LT_TIMESTAMPTZ,
+	F_TIMESTAMP_MI_INTERVAL,
+	F_TIMESTAMP_NE_TIMESTAMPTZ,
+	F_TIMESTAMP_PL_INTERVAL,
+	F_TIMESTAMP_TIMESTAMPTZ,
+	F_TIMETZ_IN,
+	F_TIME_IN,
+	F_TIME_TIMETZ,
+#if PG14_LT
+	F_INTERVAL_PART,
+	F_MAKE_TIMESTAMPTZ,
+	F_MAKE_TIMESTAMPTZ_AT_TIMEZONE,
+	F_TIMESTAMPTZ_PART,
+	F_TIMESTAMPTZ_TIME,
+	F_TIMESTAMPTZ_TIMETZ,
+	F_TIMESTAMPTZ_TRUNC,
+	F_TIMESTAMPTZ_TRUNC_ZONE,
+	F_TO_TIMESTAMP,
+#elif PG14_GE
+	F_DATE_PART_TEXT_INTERVAL,
+	F_MAKE_TIMESTAMPTZ_INT4_INT4_INT4_INT4_INT4_FLOAT8,
+	F_MAKE_TIMESTAMPTZ_INT4_INT4_INT4_INT4_INT4_FLOAT8_TEXT,
+	F_DATE_PART_TEXT_TIMESTAMPTZ,
+	F_TIME_TIMESTAMPTZ,
+	F_TIMETZ_TIMESTAMPTZ,
+	F_DATE_TRUNC_TEXT_TIMESTAMPTZ,
+	F_DATE_TRUNC_TEXT_TIMESTAMPTZ_TEXT,
+	F_TO_TIMESTAMP_TEXT_TEXT,
+#endif
 };
 static const int NumPushdownSafeOIDs =
 	sizeof(PushdownSafeFunctionOIDs) / sizeof(PushdownSafeFunctionOIDs[0]);
@@ -180,7 +218,7 @@ static void printRemoteParam(int paramindex, Oid paramtype, int32 paramtypmod,
 							 deparse_expr_cxt *context);
 static void printRemotePlaceholder(Oid paramtype, int32 paramtypmod, deparse_expr_cxt *context);
 static void deparseSelectSql(List *tlist, bool is_subquery, List **retrieved_attrs,
-							 deparse_expr_cxt *context);
+							 deparse_expr_cxt *context, List *pathkeys);
 static void deparseLockingClause(deparse_expr_cxt *context);
 static void appendOrderByClause(List *pathkeys, deparse_expr_cxt *context);
 static void appendLimit(deparse_expr_cxt *context, List *pathkeys);
@@ -732,8 +770,8 @@ build_tlist_to_deparse(RelOptInfo *foreignrel)
  * For a base relation fpinfo->attrs_used is used to construct SELECT clause,
  * hence the tlist is ignored for a base relation.
  *
- * remote_conds is the list of conditions to be deparsed into the WHERE clause
- * (or, in the case of upper relations, into the HAVING clause).
+ * remote_where is the list of conditions to be deparsed into the WHERE clause,
+ * and remote_having into the HAVING clause (this is useful for upper relations).
  *
  * If params_list is not NULL, it receives a list of Params and other-relation
  * Vars used in the clauses; these values must be transmitted to the data
@@ -751,13 +789,11 @@ build_tlist_to_deparse(RelOptInfo *foreignrel)
  */
 void
 deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel, List *tlist,
-						List *remote_conds, List *pathkeys, bool is_subquery,
-						List **retrieved_attrs, List **params_list, DataNodeChunkAssignment *sca,
-						List **current_time_idx)
+						List *remote_where, List *remote_having, List *pathkeys, bool is_subquery,
+						List **retrieved_attrs, List **params_list, DataNodeChunkAssignment *sca)
 {
 	deparse_expr_cxt context;
 	TsFdwRelInfo *fpinfo = fdw_relinfo_get(rel);
-	List *quals;
 
 	/*
 	 * We handle relations for foreign tables, joins between those and upper
@@ -771,29 +807,13 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel, List
 	context.foreignrel = rel;
 	context.scanrel = IS_UPPER_REL(rel) ? fpinfo->outerrel : rel;
 	context.params_list = params_list;
-	context.current_time_idx = current_time_idx;
 	context.sca = sca;
 
 	/* Construct SELECT clause */
-	deparseSelectSql(tlist, is_subquery, retrieved_attrs, &context);
-
-	/*
-	 * For upper relations, the WHERE clause is built from the remote
-	 * conditions of the underlying scan relation; otherwise, we can use the
-	 * supplied list of remote conditions directly.
-	 */
-	if (IS_UPPER_REL(rel))
-	{
-		TsFdwRelInfo *ofpinfo;
-
-		ofpinfo = fdw_relinfo_get(fpinfo->outerrel);
-		quals = ofpinfo->remote_conds;
-	}
-	else
-		quals = remote_conds;
+	deparseSelectSql(tlist, is_subquery, retrieved_attrs, &context, pathkeys);
 
 	/* Construct FROM and WHERE clauses */
-	deparseFromExpr(quals, &context);
+	deparseFromExpr(remote_where, &context);
 
 	if (IS_UPPER_REL(rel))
 	{
@@ -801,10 +821,10 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel, List
 		appendGroupByClause(tlist, &context);
 
 		/* Append HAVING clause */
-		if (remote_conds)
+		if (remote_having)
 		{
 			appendStringInfoString(buf, " HAVING ");
-			appendConditions(remote_conds, &context, true);
+			appendConditions(remote_having, &context, true);
 		}
 	}
 
@@ -841,7 +861,7 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel, List
  * deparsing which happens later is good enough
  */
 static void
-deparseDistinctClause(StringInfo buf, deparse_expr_cxt *context)
+deparseDistinctClause(StringInfo buf, deparse_expr_cxt *context, List *pathkeys)
 {
 	PlannerInfo *root = context->root;
 	Query *query = root->parse;
@@ -884,6 +904,60 @@ deparseDistinctClause(StringInfo buf, deparse_expr_cxt *context)
 		/* We only allow constants apart from vars, but we ignore them */
 		else if (!IsA(tle->expr, Const))
 			return;
+	}
+
+	if (query->hasDistinctOn)
+	{
+		/*
+		 * Pushing down DISTINCT ON is more complex than plain DISTINCT.
+		 * The DISTINCT ON columns must be a prefix of the ORDER BY columns.
+		 * Without this, the DISTINCT ON would return an unpredictable row
+		 * each time. There is a diagnostic for the case where the ORDER BY
+		 * clause doesn't match the DISTINCT ON clause, so in this case we
+		 * would get an error on the data node. There is no diagnostic for
+		 * the case where the ORDER BY is absent, so in this case we would
+		 * get a wrong result.
+		 * The remote ORDER BY clause is created from the pathkeys of the
+		 * corresponding relation. If the DISTINCT ON columns are not a prefix
+		 * of these pathkeys, we cannot push it down.
+		 */
+		ListCell *distinct_cell, *pathkey_cell;
+		forboth (distinct_cell, query->distinctClause, pathkey_cell, pathkeys)
+		{
+			SortGroupClause *sgc = lfirst_node(SortGroupClause, distinct_cell);
+			TargetEntry *tle = get_sortgroupclause_tle(sgc, query->targetList);
+
+			PathKey *pk = lfirst_node(PathKey, pathkey_cell);
+			EquivalenceClass *ec = pk->pk_eclass;
+
+			/*
+			 * The find_ec_member_matching_expr() has many checks that don't seem
+			 * to be relevant here. Enumerate the pathkey EquivalenceMembers by
+			 * hand and find the one that matches the DISTINCT ON expression.
+			 */
+			ListCell *ec_member_cell;
+			foreach (ec_member_cell, ec->ec_members)
+			{
+				EquivalenceMember *ec_member = lfirst_node(EquivalenceMember, ec_member_cell);
+				if (equal(ec_member->em_expr, tle->expr))
+					break;
+			}
+
+			if (ec_member_cell == NULL)
+			{
+				/*
+				 * Went through all the equivalence class members and didn't
+				 * find a match.
+				 */
+				return;
+			}
+		}
+
+		if (pathkey_cell == NULL && distinct_cell != NULL)
+		{
+			/* Ran out of pathkeys before we matched all the DISTINCT ON columns. */
+			return;
+		}
 	}
 
 	/* If there are no varno entries in the distinctClause, we are done */
@@ -956,7 +1030,8 @@ deparseDistinctClause(StringInfo buf, deparse_expr_cxt *context)
  * Read prologue of deparseSelectStmtForRel() for details.
  */
 static void
-deparseSelectSql(List *tlist, bool is_subquery, List **retrieved_attrs, deparse_expr_cxt *context)
+deparseSelectSql(List *tlist, bool is_subquery, List **retrieved_attrs, deparse_expr_cxt *context,
+				 List *pathkeys)
 {
 	StringInfo buf = context->buf;
 	RelOptInfo *foreignrel = context->foreignrel;
@@ -1000,7 +1075,7 @@ deparseSelectSql(List *tlist, bool is_subquery, List **retrieved_attrs, deparse_
 		Relation rel = table_open(rte->relid, NoLock);
 
 		if (root->parse->distinctClause != NIL)
-			deparseDistinctClause(buf, context);
+			deparseDistinctClause(buf, context, pathkeys);
 
 		deparseTargetList(buf,
 						  rte,
@@ -2863,7 +2938,7 @@ appendOrderByClause(List *pathkeys, deparse_expr_cxt *context)
 		PathKey *pathkey = lfirst(lcell);
 		Expr *em_expr;
 
-		em_expr = ts_find_em_expr_for_rel(pathkey->pk_eclass, baserel);
+		em_expr = find_em_expr_for_rel(pathkey->pk_eclass, baserel);
 		Assert(em_expr != NULL);
 
 		appendStringInfoString(buf, delim);
@@ -2952,14 +3027,6 @@ appendFunctionName(Oid funcid, deparse_expr_cxt *context)
 	}
 
 	proname = NameStr(procform->proname);
-
-	/*
-	 * If the function is the 'now' function, we'll have to replace it before pushing
-	 * it down to the data node.  For now just make a note of the index at which we're
-	 * inserting it into the sql statement.
-	 */
-	if (funcid == F_NOW && context->current_time_idx)
-		*context->current_time_idx = lappend_int(*context->current_time_idx, buf->len);
 
 	/* Always print the function name */
 	appendStringInfoString(buf, quote_identifier(proname));

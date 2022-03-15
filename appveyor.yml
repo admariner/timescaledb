@@ -1,5 +1,5 @@
 version: 1.0.{build}
-image: Visual Studio 2019
+image: Visual Studio 2019 Preview
 services:
   - postgresql12
   - docker
@@ -46,7 +46,7 @@ build_script:
 
     New-NetFirewallRule -DisplayName "Allow postgres" -Direction Inbound -Action Allow -Protocol Any -LocalPort Any
 
-    # Set user and passworkd for psql
+    # Set user and password for psql
 
     SET PGUSER=postgres
 
@@ -131,7 +131,7 @@ build_script:
 
     # build timescale
 
-     .\bootstrap -DUSE_OPENSSL=0 -DPG_PATH="C:\Program Files\PostgreSQL\12" -DREGRESS_CHECKS=OFF -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CONFIGURATION_TYPES=Debug -DCMAKE_C_FLAGS=/MP -DTAP_CHECKS=OFF
+     .\bootstrap -DUSE_OPENSSL=0 -DPG_PATH="C:\Program Files\PostgreSQL\12" -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CONFIGURATION_TYPES=Debug -DCMAKE_C_FLAGS=/MP
 
     # Filter ssl and local configuration from pg_hba.conf file since
     # we have turned off SSL and local (unix domain socket)
@@ -180,7 +180,7 @@ build_script:
 
     docker exec -it pgregress /bin/bash -c "git clone  --depth 1 https://github.com/timescale/timescaledb.git /timescaledb && cd /timescaledb && git fetch -q origin $commit && git checkout -qf FETCH_HEAD"
 
-    docker exec -it pgregress /bin/bash -c "cd /timescaledb && ./bootstrap -DCMAKE_BUILD_TYPE=Debug -DREGRESS_CHECKS=OFF -DPG_REGRESS=/usr/local/bin/pg_regress -DTEST_PGHOST=docker.for.win.localhost -DTEST_PGPORT_LOCAL=55432 -DTAP_CHECKS=OFF"
+    docker exec -it pgregress /bin/bash -c "cd /timescaledb && ./bootstrap -DCMAKE_BUILD_TYPE=Debug -DTEST_PGHOST=docker.for.win.localhost -DTEST_PGPORT_LOCAL=55432"
 
 test_script:
 - ps: >-
@@ -205,7 +205,7 @@ test_script:
     # killer. Therefore, we need to ignore the results of the
     # remote_connection and remote_txn tests.
 
-    docker exec -e IGNORES="bgw_db_scheduler compression_algos continuous_aggs_bgw debug_notice ordered_append_join-12 remote_connection remote_txn " -e SKIPS="bgw_db_scheduler" -e TEST_TABLESPACE1_PREFIX="C:\Users\$env:UserName\Documents\tablespace1\" -e TEST_TABLESPACE2_PREFIX="C:\Users\$env:UserName\Documents\tablespace2\" -e TEST_SPINWAIT_ITERS=10000 -e USER=postgres -it pgregress /bin/bash -c "cd /timescaledb/build && make -k regresschecklocal-t regresschecklocal-shared"
+    docker exec -e IGNORES="bgw_db_scheduler compression_algos cagg_bgw debug_notice ordered_append_join-12 remote_connection" -e SKIPS="bgw_db_scheduler remote_txn" -e TEST_TABLESPACE1_PREFIX="C:\Users\$env:UserName\Documents\tablespace1\" -e TEST_TABLESPACE2_PREFIX="C:\Users\$env:UserName\Documents\tablespace2\" -e TEST_SPINWAIT_ITERS=10000 -e USER=postgres -it pgregress /bin/bash -c "cd /timescaledb/build && make -k regresschecklocal-t regresschecklocal-shared"
 
     if( -not $? -or -not $TESTS1 ) { exit 1 }
 

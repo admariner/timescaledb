@@ -56,13 +56,23 @@ SELECT * FROM add_data_node('data_node_2', host => 'localhost', database => :'DN
 SELECT * FROM add_data_node('data_node_3', host => 'localhost', database => :'DN_DBNAME_3');
 
 
--- Test altering server command is blocked
+-- Altering the host, dbname, and port should work via ALTER SERVER
+BEGIN;
+ALTER SERVER data_node_3 OPTIONS (SET host 'data_node_3', SET dbname 'new_db_name', SET port '9999');
+SELECT srvname, srvoptions FROM pg_foreign_server WHERE srvname = 'data_node_3';
+-- Altering the name should work
+ALTER SERVER data_node_3 RENAME TO data_node_4;
+SELECT srvname FROM pg_foreign_server WHERE srvname = 'data_node_4';
+-- Revert name and options
+ROLLBACK;
+
 \set ON_ERROR_STOP 0
-ALTER SERVER data_node_1 OPTIONS (SET fdw_startup_cost '110.0');
-ALTER SERVER data_node_1 OPTIONS (DROP sslmode);
-ALTER SERVER data_node_1 RENAME TO data_node_k;
-ALTER SERVER data_node_1 OWNER TO CURRENT_USER;
+-- Should not be possible to set a version:
+ALTER SERVER data_node_3 VERSION '2';
 \set ON_ERROR_STOP 1
+
+-- Make sure changing server owner is allowed
+ALTER SERVER data_node_1 OWNER TO CURRENT_USER;
 
 -- List foreign data nodes
 SELECT node_name, "options" FROM timescaledb_information.data_nodes ORDER BY node_name;
@@ -101,6 +111,19 @@ SELECT * FROM add_data_node('data_node_1', host => 'localhost', database => :'DN
 SELECT * FROM add_data_node('data_node_2', host => 'localhost', database => :'DN_DBNAME_2');
 SELECT * FROM add_data_node('data_node_3', host => 'localhost', database => :'DN_DBNAME_3');
 
+SET ROLE :ROLE_1;
+
+-- Create a distributed hypertable where no nodes can be selected
+-- because there are no data nodes with the right permissions.
+CREATE TABLE disttable(time timestamptz, device int, temp float);
+\set ON_ERROR_STOP 0
+\set VERBOSITY default
+SELECT * FROM create_distributed_hypertable('disttable', 'time', 'device');
+\set VERBOSITY terse
+\set ON_ERROR_STOP 1
+
+RESET ROLE;
+
 -- Allow ROLE_1 to create distributed tables on these data nodes.
 -- We'll test that data_node_3 is properly filtered when ROLE_1
 -- creates a distributed hypertable without explicitly specifying
@@ -121,9 +144,6 @@ GROUP BY object_schema, object_name, object_type
 ORDER BY object_name, object_type;
 
 SET ROLE :ROLE_1;
-
--- Now create a distributed hypertable using the data nodes
-CREATE TABLE disttable(time timestamptz, device int, temp float);
 
 -- Test that all data nodes are added to a hypertable and that the
 -- slices in the device dimension equals the number of data nodes.
@@ -667,7 +687,7 @@ SET ROLE :ROLE_3;
 -- foreign data wrapper will fail.
 \set ON_ERROR_STOP 0
 SELECT * FROM add_data_node('data_node_6', host => 'localhost', database => :'DN_DBNAME_6');
-\set ON_ERROR_STOP 0
+\set ON_ERROR_STOP 1
 
 RESET ROLE;
 GRANT USAGE ON FOREIGN DATA WRAPPER timescaledb_fdw TO :ROLE_3;
@@ -677,118 +697,12 @@ SET ROLE :ROLE_3;
 -- ROLE_3 doesn't have a password in the passfile and has not way to
 -- authenticate so adding a data node will still fail.
 SELECT * FROM add_data_node('data_node_6', host => 'localhost', database => :'DN_DBNAME_6');
-\set ON_ERROR_STOP 0
+\set ON_ERROR_STOP 1
 
 -- Providing the password on the command line should work
 SELECT * FROM add_data_node('data_node_6', host => 'localhost', database => :'DN_DBNAME_6', password => :'ROLE_3_PASS');
+
 SELECT * FROM delete_data_node('data_node_6');
-
---
--- Tests for copy/move chunk API
---
-RESET ROLE;
-DROP DATABASE :DN_DBNAME_1;
-DROP DATABASE :DN_DBNAME_2;
-DROP DATABASE :DN_DBNAME_3;
-
-SELECT * FROM add_data_node('data_node_1', host => 'localhost',
-                            database => :'DN_DBNAME_1');
-SELECT * FROM add_data_node('data_node_2', host => 'localhost',
-                            database => :'DN_DBNAME_2');
-SELECT * FROM add_data_node('data_node_3', host => 'localhost',
-                            database => :'DN_DBNAME_3');
-GRANT USAGE ON FOREIGN SERVER data_node_1, data_node_2, data_node_3 TO PUBLIC;
-
-SET ROLE :ROLE_1;
-
-CREATE TABLE dist_test(time timestamp NOT NULL, device int, temp float);
-SELECT create_distributed_hypertable('dist_test', 'time', 'device', 3);
-INSERT INTO dist_test SELECT t, (abs(timestamp_hash(t::timestamp)) % 10) + 1, 0.10 FROM generate_series('2018-03-02 1:00'::TIMESTAMPTZ, '2018-03-08 1:00', '1 hour') t;
-SELECT * from show_chunks('dist_test');
-SELECT * FROM test.remote_exec(NULL, $$ SELECT * from show_chunks('dist_test'); $$);
-
-SELECT sum(device) FROM dist_test; 
-SELECT * FROM test.remote_exec(ARRAY['data_node_1'], $$ SELECT sum(device) FROM _timescaledb_internal._dist_hyper_9_12_chunk; $$);
-
--- ensure data node name is provided and has proper type
-\set ON_ERROR_STOP 0
-CALL timescaledb_experimental.move_chunk(chunk=>'_timescaledb_internal._dist_hyper_9_12_chunk', source_node=> null, destination_node => 'data_node_2');
-CALL timescaledb_experimental.copy_chunk(chunk=>'_timescaledb_internal._dist_hyper_9_12_chunk', source_node=> 'data_node_1', destination_node => null);
-CALL timescaledb_experimental.copy_chunk(chunk=>'_timescaledb_internal._dist_hyper_9_12_chunk', source_node=> 'data_node_1', destination_node => 2);
-CALL timescaledb_experimental.move_chunk(chunk=>'_timescaledb_internal._dist_hyper_9_12_chunk', source_node => 'data_node_1');
-\set ON_ERROR_STOP 1
-
--- ensure functions can't be run in read only mode
-SET default_transaction_read_only TO on;
-\set ON_ERROR_STOP 0
-CALL timescaledb_experimental.move_chunk(chunk=>'_timescaledb_internal._dist_hyper_9_12_chunk', source_node=> 'data_node_1', destination_node => 'data_node_2');
-CALL timescaledb_experimental.copy_chunk(chunk=>'_timescaledb_internal._dist_hyper_9_12_chunk', source_node=> 'data_node_1', destination_node => 'data_node_2');
-\set ON_ERROR_STOP 1
-SET default_transaction_read_only TO off;
-
--- ensure functions can't be run in an active multi-statement transaction
-\set ON_ERROR_STOP 0
-BEGIN;
-CALL timescaledb_experimental.move_chunk(chunk=>'_timescaledb_internal._dist_hyper_9_12_chunk', source_node=> 'data_node_1', destination_node => 'data_node_2');
-ROLLBACK;
-BEGIN;
-CALL timescaledb_experimental.copy_chunk(chunk=>'_timescaledb_internal._dist_hyper_9_12_chunk', source_node=> 'data_node_1', destination_node => 'data_node_2');
-ROLLBACK;
-\set ON_ERROR_STOP 1
-
--- must be superuser to copy/move chunks
-SET ROLE :ROLE_DEFAULT_PERM_USER;
-\set ON_ERROR_STOP 0
-CALL timescaledb_experimental.move_chunk(chunk=>'_timescaledb_internal._dist_hyper_9_12_chunk', source_node=> 'data_node_1', destination_node => 'data_node_2');
-\set ON_ERROR_STOP 1
-SET ROLE :ROLE_1;
-
--- can't run copy/move chunk on a data node
-\c :DN_DBNAME_1 :ROLE_CLUSTER_SUPERUSER;
-\set ON_ERROR_STOP 0
-CALL timescaledb_experimental.move_chunk(chunk=>'_timescaledb_internal._dist_hyper_9_12_chunk', source_node=> 'data_node_1', destination_node => 'data_node_2');
-CALL timescaledb_experimental.copy_chunk(chunk=>'_timescaledb_internal._dist_hyper_9_12_chunk', source_node=> 'data_node_1', destination_node => 'data_node_2');
-\set ON_ERROR_STOP 1
-\c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER;
-
--- ensure that hypertable chunks are distributed
-CREATE TABLE nondist_test(time timestamp NOT NULL, device int, temp float);
-SELECT create_hypertable('nondist_test', 'time', 'device', 3);
-INSERT INTO nondist_test SELECT t, (abs(timestamp_hash(t::timestamp)) % 10) + 1, 0.10 FROM generate_series('2018-03-02 1:00'::TIMESTAMPTZ, '2018-03-08 1:00', '1 hour') t;
-SELECT * from show_chunks('nondist_test');
-\set ON_ERROR_STOP 0
-CALL timescaledb_experimental.move_chunk(chunk=>'_timescaledb_internal._hyper_10_16_chunk', source_node=> 'data_node_1', destination_node => 'data_node_2');
-CALL timescaledb_experimental.copy_chunk(chunk=>'_timescaledb_internal._hyper_10_16_chunk', source_node=> 'data_node_1', destination_node => 'data_node_2');
-\set ON_ERROR_STOP 1
-
--- ensure that distributed chunk is not compressed
-ALTER TABLE dist_test SET (timescaledb.compress, timescaledb.compress_segmentby='device', timescaledb.compress_orderby = 'time DESC');
-SELECT compress_chunk('_timescaledb_internal._dist_hyper_9_15_chunk');
-\set ON_ERROR_STOP 0
-CALL timescaledb_experimental.move_chunk(chunk=>'_timescaledb_internal._dist_hyper_9_15_chunk', source_node=> 'data_node_1', destination_node => 'data_node_2');
-CALL timescaledb_experimental.copy_chunk(chunk=>'_timescaledb_internal._dist_hyper_9_15_chunk', source_node=> 'data_node_1', destination_node => 'data_node_2');
-\set ON_ERROR_STOP 1
-
--- ensure that chunk exists on a source data node
-\set ON_ERROR_STOP 0
-CALL timescaledb_experimental.move_chunk(chunk=>'_timescaledb_internal._dist_hyper_9_13_chunk', source_node=> 'data_node_1', destination_node => 'data_node_2');
-\set ON_ERROR_STOP 1
-
--- do actualy copy
-CALL timescaledb_experimental.copy_chunk(chunk=>'_timescaledb_internal._dist_hyper_9_12_chunk', source_node=> 'data_node_1', destination_node => 'data_node_2');
-SELECT * FROM test.remote_exec(NULL, $$ SELECT * from show_chunks('dist_test'); $$);
-SELECT * FROM test.remote_exec(ARRAY['data_node_2'], $$ SELECT sum(device) FROM _timescaledb_internal._dist_hyper_9_12_chunk; $$);
-
--- ensure that chunk exists on a destination data node
-\set ON_ERROR_STOP 0
-CALL timescaledb_experimental.copy_chunk(chunk=>'_timescaledb_internal._dist_hyper_9_12_chunk', source_node=> 'data_node_1', destination_node => 'data_node_2');
-\set ON_ERROR_STOP 1
-
--- now try to move the same chunk from data node 2 to 3
-CALL timescaledb_experimental.move_chunk(chunk=>'_timescaledb_internal._dist_hyper_9_12_chunk', source_node=> 'data_node_2', destination_node => 'data_node_3');
-SELECT * FROM test.remote_exec(NULL, $$ SELECT * from show_chunks('dist_test'); $$);
-SELECT * FROM test.remote_exec(ARRAY['data_node_3'], $$ SELECT sum(device) FROM _timescaledb_internal._dist_hyper_9_12_chunk; $$);
-SELECT sum(device) FROM dist_test; 
 
 RESET ROLE;
 DROP DATABASE :DN_DBNAME_1;

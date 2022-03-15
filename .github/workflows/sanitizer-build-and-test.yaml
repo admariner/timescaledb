@@ -43,7 +43,7 @@ jobs:
       matrix:
         # "os" has to be in the matrix due to a bug in "env": https://github.community/t/how-to-use-env-context/16975
         os: ["ubuntu-20.04"]
-        pg: ["12.7", "13.3"]
+        pg: ["12.10", "13.6", "14.2"]
     steps:
     - name: Install Linux Dependencies
       run: |
@@ -82,7 +82,7 @@ jobs:
 
     - name: Build TimescaleDB
       run: |
-        ./bootstrap -DCMAKE_BUILD_TYPE=Debug -DPG_SOURCE_DIR=~/$PG_SRC_DIR -DPG_PATH=~/$PG_INSTALL_DIR -DCODECOVERAGE=OFF
+        ./bootstrap -DCMAKE_BUILD_TYPE=Debug -DPG_SOURCE_DIR=~/$PG_SRC_DIR -DPG_PATH=~/$PG_INSTALL_DIR -DCODECOVERAGE=OFF -DREQUIRE_ALL_TESTS=ON
         make -j $MAKE_JOBS -C build
         make -C build install
 

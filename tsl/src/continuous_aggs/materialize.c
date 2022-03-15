@@ -14,9 +14,9 @@
 #include <utils/snapmgr.h>
 
 #include <scanner.h>
-#include <compat.h>
+#include <compat/compat.h>
 #include <scan_iterator.h>
-#include <continuous_agg.h>
+#include "ts_catalog/continuous_agg.h"
 #include <time_utils.h>
 
 #include "materialize.h"

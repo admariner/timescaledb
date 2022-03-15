@@ -25,13 +25,14 @@
 #include <funcapi.h>
 #include <miscadmin.h>
 #include <fmgr.h>
+#include <executor/spi.h>
 
-#if USE_ASSERT_CHECKING
+#ifdef USE_ASSERT_CHECKING
 #include <funcapi.h>
 #endif
 
-#include <compat.h>
-#include <chunk_data_node.h>
+#include <compat/compat.h>
+#include "ts_catalog/chunk_data_node.h"
 #include <extension.h>
 #include <errors.h>
 #include <error_utils.h>
@@ -189,7 +190,7 @@ chunk_copy_operation_scan_update_by_id(const char *operation_id, tuple_found_fun
 				Anum_chunk_copy_operation_idx_operation_id,
 				BTEqualStrategyNumber,
 				F_NAMEEQ,
-				DirectFunctionCall1(namein, CStringGetDatum(operation_id)));
+				CStringGetDatum(operation_id));
 
 	return ts_scanner_scan(&scanctx);
 }
@@ -246,7 +247,7 @@ chunk_copy_operation_delete_by_id(const char *operation_id)
 				Anum_chunk_copy_operation_idx_operation_id,
 				BTEqualStrategyNumber,
 				F_NAMEEQ,
-				DirectFunctionCall1(namein, CStringGetDatum(operation_id)));
+				CStringGetDatum(operation_id));
 
 	return ts_scanner_scan(&scanctx);
 }
@@ -349,9 +350,9 @@ chunk_copy_setup(ChunkCopy *cc, Oid chunk_relid, const char *src_node, const cha
 	ts_cache_release(hcache);
 	MemoryContextSwitchTo(old);
 
-	/* Commit to get out of starting transaction */
-	PopActiveSnapshot();
-	CommitTransactionCommand();
+	/* Commit to get out of starting transaction. This will also pop active
+	 * snapshots. */
+	SPI_commit();
 }
 
 static void
@@ -361,7 +362,7 @@ chunk_copy_finish(ChunkCopy *cc)
 	MemoryContextDelete(cc->mcxt);
 
 	/* Start a transaction for the final outer transaction */
-	StartTransactionCommand();
+	SPI_start_transaction();
 }
 
 static void
@@ -783,7 +784,7 @@ chunk_copy_execute(ChunkCopy *cc)
 	 */
 	for (stage = &chunk_copy_stages[0]; stage->name != NULL; stage++)
 	{
-		StartTransactionCommand();
+		SPI_start_transaction();
 
 		cc->stage = stage;
 		cc->stage->function(cc);
@@ -793,7 +794,7 @@ chunk_copy_execute(ChunkCopy *cc)
 
 		DEBUG_ERROR_INJECTION(stage->name);
 
-		CommitTransactionCommand();
+		SPI_commit();
 	}
 }
 
@@ -855,7 +856,7 @@ chunk_copy_operation_get(const char *operation_id)
 					Anum_chunk_copy_operation_idx_operation_id,
 					BTEqualStrategyNumber,
 					F_NAMEEQ,
-					DirectFunctionCall1(namein, CStringGetDatum(operation_id)));
+					CStringGetDatum(operation_id));
 		indexid = CHUNK_COPY_OPERATION_PKEY_IDX;
 	}
 	else
@@ -912,7 +913,7 @@ chunk_copy_cleanup_internal(ChunkCopy *cc, int stage_idx)
 	/* Cleanup each copy stage in a separate transaction */
 	do
 	{
-		StartTransactionCommand();
+		SPI_start_transaction();
 
 		cc->stage = &chunk_copy_stages[stage_idx];
 		if (cc->stage->function_cleanup)
@@ -924,7 +925,7 @@ chunk_copy_cleanup_internal(ChunkCopy *cc, int stage_idx)
 		else
 			first = false;
 
-		CommitTransactionCommand();
+		SPI_commit();
 	} while (--stage_idx >= 0);
 }
 
@@ -974,9 +975,9 @@ chunk_copy_cleanup(const char *operation_id)
 				 errmsg("stage '%s' not found for copy chunk cleanup",
 						NameStr(cc->fd.completed_stage))));
 
-	/* Commit to get out of starting transaction */
-	PopActiveSnapshot();
-	CommitTransactionCommand();
+	/* Commit to get out of starting transaction, this will also pop active
+	 * snapshots. */
+	SPI_commit();
 
 	/* Run the corresponding cleanup steps to roll back the activity. */
 	PG_TRY();

@@ -4,7 +4,5 @@
 
 \ir cleanup.bigint.sql
 \ir cleanup.constraints.sql
-\ir cleanup.insert_bigint.v2.sql
 \ir cleanup.timestamp.sql
-\ir cleanup.insert_timestamp.sql
-\ir cleanup.drop_meta.sql
+

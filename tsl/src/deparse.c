@@ -32,7 +32,7 @@
 #include <extension.h>
 #include <utils.h>
 #include <export.h>
-#include <compat.h>
+#include <compat/compat.h>
 #include <trigger.h>
 
 #include "deparse.h"
@@ -170,14 +170,22 @@ deparse_columns(StringInfo stmt, Relation rel)
 	{
 		int dim_idx;
 		Form_pg_attribute attr = TupleDescAttr(rel_desc, att_idx);
+		bits16 flags = FORMAT_TYPE_TYPEMOD_GIVEN;
 
 		if (attr->attisdropped)
 			continue;
 
+		/*
+		 * if it's not a builtin type then schema qualify the same. There's a function
+		 * deparse_type_name in fdw, but we don't want cross linking unnecessarily
+		 */
+		if (attr->atttypid >= FirstBootstrapObjectIdCompat)
+			flags |= FORMAT_TYPE_FORCE_QUALIFY;
+
 		appendStringInfo(stmt,
 						 "\"%s\" %s",
 						 NameStr(attr->attname),
-						 format_type_with_typemod(attr->atttypid, attr->atttypmod));
+						 format_type_extended(attr->atttypid, attr->atttypmod, flags));
 
 		if (attr->attnotnull)
 			appendStringInfoString(stmt, " NOT NULL");
@@ -673,8 +681,8 @@ deparse_get_distributed_hypertable_create_command(Hypertable *ht)
 	}
 
 	/*
-	 * Backend is assumed to not have any preexisting conflicting table or hypertable.  Any default
-	 * indices will have already been created by the frontend.
+	 * Data node is assumed to not have any preexisting conflicting table or hypertable.
+	 * Any default indices will have already been created by the access node.
 	 */
 	appendStringInfoString(hypertable_cmd, ", if_not_exists => FALSE");
 	appendStringInfoString(hypertable_cmd, ", migrate_data => FALSE");
@@ -913,4 +921,189 @@ deparse_oid_function_call_coll(Oid funcid, Oid collation, unsigned int num_args,
 		elog(ERROR, "function %u returned NULL", flinfo.fn_oid);
 
 	return result;
+}
+
+const char *
+deparse_grant_revoke_on_database(const GrantStmt *stmt, const char *dbname)
+{
+	ListCell *lc;
+
+	/*
+	   GRANT { { CREATE | CONNECT | TEMPORARY | TEMP } [, ...] | ALL [ PRIVILEGES ] }
+	   ON DATABASE database_name [, ...]
+	   TO role_specification [, ...] [ WITH GRANT OPTION ]
+	   [ GRANTED BY role_specification ]
+
+	   REVOKE [ GRANT OPTION FOR ]
+	   { { CREATE | CONNECT | TEMPORARY | TEMP } [, ...] | ALL [ PRIVILEGES ] }
+	   ON DATABASE database_name [, ...]
+	   FROM role_specification [, ...]
+	   [ GRANTED BY role_specification ]
+	   [ CASCADE | RESTRICT ]
+	*/
+	StringInfo command = makeStringInfo();
+
+	/* GRANT/REVOKE */
+	if (stmt->is_grant)
+		appendStringInfoString(command, "GRANT ");
+	else
+		appendStringInfoString(command, "REVOKE ");
+
+	/* privileges [, ...] | ALL */
+	if (stmt->privileges == NULL)
+	{
+		/* ALL */
+		appendStringInfoString(command, "ALL ");
+	}
+	else
+	{
+		foreach (lc, stmt->privileges)
+		{
+			AccessPriv *priv = lfirst(lc);
+
+			appendStringInfo(command,
+							 "%s%s ",
+							 priv->priv_name,
+							 lnext_compat(stmt->privileges, lc) != NULL ? "," : "");
+		}
+	}
+
+	/* Set database name of the data node */
+	appendStringInfo(command, "ON DATABASE %s ", quote_identifier(dbname));
+
+	/* TO/FROM role_spec [, ...] */
+	if (stmt->is_grant)
+		appendStringInfoString(command, "TO ");
+	else
+		appendStringInfoString(command, "FROM ");
+
+	foreach (lc, stmt->grantees)
+	{
+		RoleSpec *role_spec = lfirst(lc);
+		const char *role_name = NULL;
+		switch (role_spec->roletype)
+		{
+			case ROLESPEC_CSTRING:
+				role_name = role_spec->rolename;
+				break;
+			case ROLESPEC_PUBLIC:
+				role_name = "PUBLIC";
+				break;
+			case ROLESPEC_SESSION_USER:
+				role_name = "SESSION_USER";
+				break;
+			case ROLESPEC_CURRENT_USER:
+				role_name = "CURRENT_USER";
+				break;
+#if PG14_GE
+			case ROLESPEC_CURRENT_ROLE:
+				role_name = "CURRENT_ROLE";
+				break;
+#endif
+		}
+		appendStringInfo(command,
+						 "%s%s ",
+						 role_name,
+						 lnext_compat(stmt->grantees, lc) != NULL ? "," : "");
+	}
+
+	if (stmt->grant_option)
+		appendStringInfoString(command, "WITH GRANT OPTION ");
+
+#if PG14_GE
+	/* [ GRANTED BY role_specification ] */
+	if (stmt->grantor)
+		appendStringInfo(command, "GRANTED BY %s ", quote_identifier(stmt->grantor->rolename));
+#endif
+
+	/* CASCADE | RESTRICT */
+	if (!stmt->is_grant && stmt->behavior == DROP_CASCADE)
+		appendStringInfoString(command, "CASCADE");
+
+	return command->data;
+}
+
+/* Deparse user-defined trigger */
+const char *
+deparse_create_trigger(CreateTrigStmt *stmt)
+{
+	ListCell *lc;
+	bool found_event = false;
+	bool found_first_arg = false;
+
+	/*
+	CREATE [ CONSTRAINT ] TRIGGER name { BEFORE | AFTER | INSTEAD OF } { event [ OR ... ] }
+		ON table_name
+		[ FROM referenced_table_name ]
+		[ NOT DEFERRABLE | [ DEFERRABLE ] [ INITIALLY IMMEDIATE | INITIALLY DEFERRED ] ]
+		[ REFERENCING { { OLD | NEW } TABLE [ AS ] transition_relation_name } [ ... ] ]
+		[ FOR [ EACH ] { ROW | STATEMENT } ]
+		[ WHEN ( condition ) ]
+		EXECUTE { FUNCTION | PROCEDURE } function_name ( arguments )
+	*/
+	if (stmt->isconstraint)
+		elog(ERROR, "deparsing constraint triggers is not supported");
+
+	StringInfo command = makeStringInfo();
+	appendStringInfo(command, "CREATE TRIGGER %s ", quote_identifier(stmt->trigname));
+
+	if (TRIGGER_FOR_BEFORE(stmt->timing))
+		appendStringInfoString(command, "BEFORE");
+	else if (TRIGGER_FOR_AFTER(stmt->timing))
+		appendStringInfoString(command, "AFTER");
+	else if (TRIGGER_FOR_INSTEAD(stmt->timing))
+		appendStringInfoString(command, "INSTEAD OF");
+	else
+		elog(ERROR, "unexpected timing value: %d", stmt->timing);
+
+	if (TRIGGER_FOR_INSERT(stmt->events))
+	{
+		appendStringInfoString(command, " INSERT");
+		found_event = true;
+	}
+	if (TRIGGER_FOR_DELETE(stmt->events))
+	{
+		if (found_event)
+			appendStringInfoString(command, " OR");
+		appendStringInfoString(command, " DELETE");
+		found_event = true;
+	}
+	if (TRIGGER_FOR_UPDATE(stmt->events))
+	{
+		if (found_event)
+			appendStringInfoString(command, " OR");
+		appendStringInfoString(command, " UPDATE");
+		found_event = true;
+	}
+	if (TRIGGER_FOR_TRUNCATE(stmt->events))
+	{
+		if (found_event)
+			appendStringInfoString(command, " OR");
+		appendStringInfoString(command, " TRUNCATE");
+	}
+	appendStringInfo(command,
+					 " ON %s.%s",
+					 quote_identifier(stmt->relation->schemaname),
+					 quote_identifier(stmt->relation->relname));
+
+	if (stmt->row)
+		appendStringInfoString(command, " FOR EACH ROW");
+	else
+		appendStringInfoString(command, " FOR EACH STATEMENT");
+
+	if (stmt->whenClause)
+		elog(ERROR, "deparsing trigger WHEN clause is not supported");
+
+	appendStringInfo(command, " EXECUTE FUNCTION %s(", NameListToQuotedString(stmt->funcname));
+	foreach (lc, stmt->args)
+	{
+		if (found_first_arg)
+			appendStringInfoString(command, ", ");
+		else
+			found_first_arg = true;
+		appendStringInfoString(command, strVal(lfirst(lc)));
+	}
+	appendStringInfoString(command, ")");
+
+	return command->data;
 }

@@ -7,6 +7,7 @@
 #include <access/xact.h>
 #include <utils/fmgrprotos.h>
 
+#include <stdlib.h>
 #include <math.h>
 
 #include "job_stat.h"
@@ -179,12 +180,7 @@ static float8
 calculate_jitter_percent()
 {
 	/* returns a number in the range [-0.125, 0.125] */
-	/* right now we use the postgres user-space RNG. if we become worried about
-	 * correlated schedulers we can switch to
-	 *     pg_strong_random(&percent, sizeof(percent));
-	 * though we would need to figure out a way to make our tests pass
-	 */
-	uint8 percent = pg_lrand48();
+	uint8 percent = random();
 	return ldexp((double) (16 - (int) (percent % 32)), -7);
 }
 
@@ -205,6 +201,7 @@ calculate_next_start_on_failure(TimestampTz finish_time, int consecutive_failure
 	float8 multiplier = (consecutive_failures > MAX_FAILURES_MULTIPLIER ? MAX_FAILURES_MULTIPLIER :
 																		  consecutive_failures);
 	MemoryContext oldctx;
+
 	if (!IS_VALID_TIMESTAMP(finish_time))
 	{
 		elog(LOG, "%s: invalid finish time", __func__);

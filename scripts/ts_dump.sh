@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 
-# Copyright (c) 2016-2018  Timescale, Inc. All Rights Reserved.
-#
-# This file is licensed under the Apache License, see LICENSE-APACHE
-# at the top level directory of the timescaledb distribution.
+#  This file and its contents are licensed under the Apache License 2.0.
+#  Please see the included NOTICE for copyright information and
+#  LICENSE-APACHE for a copy of the license.
 
 # This script is used for backing up a single hypertable into an easy-to-restore
 # tarball. The tarball contains two files: (1) a .sql file for recreating the
@@ -30,14 +29,14 @@ PREFIX=$2
 shift 2
 set -e
 echo "Backing up schema as $PREFIX-schema.sql..."
-pg_dump $@ --schema-only -t $HYPERTABLE -f $PREFIX-schema.sql
-echo "--" >> $PREFIX-schema.sql
-echo "-- Restore to hypertable" >> $PREFIX-schema.sql
-echo "--" >> $PREFIX-schema.sql
-psql $@ -qAtX -c "SELECT _timescaledb_internal.get_create_command('$HYPERTABLE');" >> $PREFIX-schema.sql
+pg_dump "$@" --schema-only -t $HYPERTABLE -f $PREFIX-schema.sql
+echo >> $PREFIX-schema.sql "--
+-- Restore to hypertable
+--"
+psql "$@" -qAtX -c "SELECT _timescaledb_internal.get_create_command('$HYPERTABLE');" >> $PREFIX-schema.sql
 
 echo "Backing up data as $PREFIX-data.csv..."
-psql $@ -c "\COPY (SELECT * FROM $HYPERTABLE) TO $PREFIX-data.csv DELIMITER ',' CSV"
+psql "$@" -c "\COPY (SELECT * FROM $HYPERTABLE) TO $PREFIX-data.csv DELIMITER ',' CSV"
 
 echo "Archiving and removing previous files..."
 tar -czvf $PREFIX.tar.gz $PREFIX-data.csv $PREFIX-schema.sql

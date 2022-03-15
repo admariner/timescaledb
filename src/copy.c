@@ -36,14 +36,14 @@
 #include <utils/rel.h>
 #include <utils/rls.h>
 
-#include "hypertable.h"
+#include "compat/compat.h"
 #include "copy.h"
-#include "dimension.h"
-#include "nodes/chunk_insert_state.h"
-#include "nodes/chunk_dispatch.h"
-#include "subspace_store.h"
-#include "compat.h"
 #include "cross_module_fn.h"
+#include "dimension.h"
+#include "hypertable.h"
+#include "nodes/chunk_dispatch.h"
+#include "nodes/chunk_insert_state.h"
+#include "subspace_store.h"
 
 /*
  * Copy from a file to a hypertable.
@@ -56,7 +56,7 @@
  */
 
 static CopyChunkState *
-copy_chunk_state_create(Hypertable *ht, Relation rel, CopyFromFunc from_func, CopyState cstate,
+copy_chunk_state_create(Hypertable *ht, Relation rel, CopyFromFunc from_func, CopyFromState cstate,
 						TableScanDesc scandesc)
 {
 	CopyChunkState *ccstate;
@@ -143,6 +143,7 @@ copyfrom(CopyChunkState *ccstate, List *range_table, Hypertable *ht, void (*call
 	BulkInsertState bistate;
 	uint64 processed = 0;
 	ExprState *qualexpr = NULL;
+	ChunkDispatch *dispatch = ccstate->dispatch;
 
 	Assert(range_table);
 
@@ -231,11 +232,16 @@ copyfrom(CopyChunkState *ccstate, List *range_table, Hypertable *ht, void (*call
 	 */
 	resultRelInfo = makeNode(ResultRelInfo);
 
+#if PG14_LT
 	InitResultRelInfo(resultRelInfo,
 					  ccstate->rel,
 					  /* RangeTableIndex */ 1,
 					  NULL,
 					  0);
+#else
+	ExecInitRangeTable(estate, range_table);
+	ExecInitResultRelation(estate, resultRelInfo, 1);
+#endif
 
 	CheckValidResultRel(resultRelInfo, CMD_INSERT);
 
@@ -244,11 +250,14 @@ copyfrom(CopyChunkState *ccstate, List *range_table, Hypertable *ht, void (*call
 #if PG14_LT
 	estate->es_result_relations = resultRelInfo;
 	estate->es_num_result_relations = 1;
-#endif
 	estate->es_result_relation_info = resultRelInfo;
 	estate->es_range_table = range_table;
 
 	ExecInitRangeTable(estate, estate->es_range_table);
+#endif
+
+	if (!dispatch->hypertable_result_rel_info)
+		dispatch->hypertable_result_rel_info = resultRelInfo;
 
 	singleslot = table_slot_create(resultRelInfo->ri_RelationDesc, &estate->es_tupleTable);
 
@@ -272,7 +281,7 @@ copyfrom(CopyChunkState *ccstate, List *range_table, Hypertable *ht, void (*call
 	/* Set up callback to identify error line number.
 	 *
 	 * It is not necessary to add an entry to the error context stack if we do
-	 * not have a CopyState or callback. In that case, we just use the existing
+	 * not have a CopyFromState or callback. In that case, we just use the existing
 	 * error already on the context stack. */
 	if (ccstate->cstate && callback)
 	{
@@ -285,7 +294,6 @@ copyfrom(CopyChunkState *ccstate, List *range_table, Hypertable *ht, void (*call
 		TupleTableSlot *myslot;
 		bool skip_tuple;
 		Point *point;
-		ChunkDispatch *dispatch = ccstate->dispatch;
 		ChunkInsertState *cis;
 
 		CHECK_FOR_INTERRUPTS();
@@ -306,10 +314,6 @@ copyfrom(CopyChunkState *ccstate, List *range_table, Hypertable *ht, void (*call
 
 		/* Calculate the tuple's point in the N-dimensional hyperspace */
 		point = ts_hyperspace_calculate_point(ht->space, myslot);
-
-		/* Save the main table's (hypertable's) ResultRelInfo */
-		if (NULL == dispatch->hypertable_result_rel_info)
-			dispatch->hypertable_result_rel_info = estate->es_result_relation_info;
 
 		/* Find or create the insert state matching the point */
 		cis = ts_chunk_dispatch_get_chunk_insert_state(dispatch,
@@ -340,10 +344,12 @@ copyfrom(CopyChunkState *ccstate, List *range_table, Hypertable *ht, void (*call
 		 */
 		saved_resultRelInfo = resultRelInfo;
 		resultRelInfo = cis->result_relation_info;
+#if PG14_LT
 		estate->es_result_relation_info = resultRelInfo;
+#endif
 
-		if (cis->compress_state != NULL)
-			check_resultRelInfo = cis->orig_result_relation_info;
+		if (cis->compress_info != NULL)
+			check_resultRelInfo = cis->compress_info->orig_result_relation_info;
 		else
 			check_resultRelInfo = resultRelInfo;
 
@@ -369,7 +375,7 @@ copyfrom(CopyChunkState *ccstate, List *range_table, Hypertable *ht, void (*call
 			/* Compute stored generated columns */
 			if (check_resultRelInfo->ri_RelationDesc->rd_att->constr &&
 				check_resultRelInfo->ri_RelationDesc->rd_att->constr->has_generated_stored)
-				ExecComputeStoredGeneratedCompat(estate, myslot, CMD_INSERT);
+				ExecComputeStoredGeneratedCompat(check_resultRelInfo, estate, myslot, CMD_INSERT);
 
 			/*
 			 * If the target is a plain table, check the constraints of
@@ -382,17 +388,38 @@ copyfrom(CopyChunkState *ccstate, List *range_table, Hypertable *ht, void (*call
 				ExecConstraints(check_resultRelInfo, myslot, estate);
 			}
 
-			if (cis->compress_state)
+			if (cis->compress_info)
 			{
 				TupleTableSlot *compress_slot =
-					ts_cm_functions->compress_row_exec(cis->compress_state, myslot);
+					ts_cm_functions->compress_row_exec(cis->compress_info->compress_state, myslot);
+				/* After Row triggers do not work with compressed chunks. So
+				 * explicitly call cagg trigger here
+				 */
+				if (cis->compress_info->has_cagg_trigger)
+				{
+					HeapTupleTableSlot *hslot = (HeapTupleTableSlot *) myslot;
+					if (!hslot->tuple)
+						hslot->tuple = heap_form_tuple(myslot->tts_tupleDescriptor,
+													   myslot->tts_values,
+													   myslot->tts_isnull);
+					ts_compress_chunk_invoke_cagg_trigger(cis->compress_info,
+														  cis->rel,
+														  hslot->tuple);
+				}
+
 				table_tuple_insert(resultRelInfo->ri_RelationDesc,
 								   compress_slot,
 								   mycid,
 								   ti_options,
 								   bistate);
 				if (resultRelInfo->ri_NumIndices > 0)
-					recheckIndexes = ExecInsertIndexTuples(compress_slot, estate, false, NULL, NIL);
+					recheckIndexes = ExecInsertIndexTuplesCompat(resultRelInfo,
+																 compress_slot,
+																 estate,
+																 false,
+																 false,
+																 NULL,
+																 NIL);
 			}
 			else
 			{
@@ -404,15 +431,20 @@ copyfrom(CopyChunkState *ccstate, List *range_table, Hypertable *ht, void (*call
 								   bistate);
 
 				if (resultRelInfo->ri_NumIndices > 0)
-					recheckIndexes = ExecInsertIndexTuples(myslot, estate, false, NULL, NIL);
+					recheckIndexes = ExecInsertIndexTuplesCompat(resultRelInfo,
+																 myslot,
+																 estate,
+																 false,
+																 false,
+																 NULL,
+																 NIL);
+				/* AFTER ROW INSERT Triggers */
+				ExecARInsertTriggers(estate,
+									 check_resultRelInfo,
+									 myslot,
+									 recheckIndexes,
+									 NULL /* transition capture */);
 			}
-
-			/* AFTER ROW INSERT Triggers */
-			ExecARInsertTriggers(estate,
-								 check_resultRelInfo,
-								 myslot,
-								 recheckIndexes,
-								 NULL /* transition capture */);
 
 			list_free(recheckIndexes);
 
@@ -425,10 +457,14 @@ copyfrom(CopyChunkState *ccstate, List *range_table, Hypertable *ht, void (*call
 		}
 
 		resultRelInfo = saved_resultRelInfo;
+#if PG14_LT
 		estate->es_result_relation_info = resultRelInfo;
+#endif
 	}
 
+#if PG14_LT
 	estate->es_result_relation_info = ccstate->dispatch->hypertable_result_rel_info;
+#endif
 
 	/* Done, clean up */
 	if (errcallback.previous)
@@ -446,9 +482,9 @@ copyfrom(CopyChunkState *ccstate, List *range_table, Hypertable *ht, void (*call
 
 	ExecResetTupleTable(estate->es_tupleTable, false);
 
+#if PG14_LT
 	ExecCloseIndices(resultRelInfo);
 	/* Close any trigger target relations */
-#if PG14_LT
 	ExecCleanUpTriggerState(estate);
 #else
 	ExecCloseResultRelations(estate);
@@ -608,7 +644,7 @@ void
 timescaledb_DoCopy(const CopyStmt *stmt, const char *queryString, uint64 *processed, Hypertable *ht)
 {
 	CopyChunkState *ccstate;
-	CopyState cstate;
+	CopyFromState cstate;
 	bool pipe = (stmt->filename == NULL);
 	Relation rel;
 	List *attnums = NIL;
@@ -653,6 +689,9 @@ timescaledb_DoCopy(const CopyStmt *stmt, const char *queryString, uint64 *proces
 
 	cstate = BeginCopyFrom(pstate,
 						   rel,
+#if PG14_GE
+						   NULL,
+#endif
 						   stmt->filename,
 						   stmt->is_program,
 						   NULL,

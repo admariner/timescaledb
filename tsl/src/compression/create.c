@@ -31,16 +31,16 @@
 #include <utils/syscache.h>
 #include <utils/typcache.h>
 
-#include "catalog.h"
+#include "ts_catalog/catalog.h"
 #include "create.h"
 #include "chunk.h"
 #include "chunk_index.h"
-#include "continuous_agg.h"
-#include "compat.h"
+#include "ts_catalog/continuous_agg.h"
+#include "compat/compat.h"
 #include "compression_with_clause.h"
 #include "compression.h"
 #include "hypertable_cache.h"
-#include "hypertable_compression.h"
+#include "ts_catalog/hypertable_compression.h"
 #include "custom_type_cache.h"
 #include "trigger.h"
 #include "utils.h"
@@ -587,6 +587,7 @@ create_compress_chunk_table(Hypertable *compress_ht, Chunk *src_chunk)
 	CatalogSecurityContext sec_ctx;
 	Chunk *compress_chunk;
 	int namelen;
+	Oid tablespace_oid;
 	const char *tablespace;
 
 	/* Create a new chunk based on the hypercube */
@@ -632,16 +633,24 @@ create_compress_chunk_table(Hypertable *compress_ht, Chunk *src_chunk)
 	 * on which to base this decision. We simply pick the same tablespace as the uncompressed chunk
 	 * for now.
 	 */
-	tablespace = get_tablespace_name(get_rel_tablespace(src_chunk->table_id));
+	tablespace_oid = get_rel_tablespace(src_chunk->table_id);
+	tablespace = get_tablespace_name(tablespace_oid);
 	compress_chunk->table_id = ts_chunk_create_table(compress_chunk, compress_ht, tablespace);
 
 	if (!OidIsValid(compress_chunk->table_id))
 		elog(ERROR, "could not create compressed chunk table");
 
+	/* if the src chunk is not in the default tablespace, the compressed indexes
+	 * should also be in a non-default tablespace. IN the usual case, this is inferred
+	 * from the hypertable's and chunk's tablespace info. We do not propagate
+	 * attach_tablespace settings to the compressed hypertable. So we have to explicitly
+	 * pass the tablespace information here
+	 */
 	ts_chunk_index_create_all(compress_chunk->fd.hypertable_id,
 							  compress_chunk->hypertable_relid,
 							  compress_chunk->fd.id,
-							  compress_chunk->table_id);
+							  compress_chunk->table_id,
+							  tablespace_oid);
 
 	return compress_chunk;
 }
@@ -934,6 +943,24 @@ add_column_to_compression_table(Hypertable *compress_ht, CompressColInfo *compre
 	modify_compressed_toast_table_storage(compress_cols, compress_relid);
 }
 
+/* Drop column from internal compression table */
+static void
+drop_column_from_compression_table(Hypertable *compress_ht, char *name)
+{
+	Oid compress_relid = compress_ht->main_table_relid;
+	AlterTableCmd *cmd;
+
+	/* create altertable stmt to drop column from the compressed hypertable */
+	Assert(TS_HYPERTABLE_IS_INTERNAL_COMPRESSION_TABLE(compress_ht));
+	cmd = makeNode(AlterTableCmd);
+	cmd->subtype = AT_DropColumn;
+	cmd->name = name;
+	cmd->missing_ok = true;
+
+	/* alter the table and drop column */
+	AlterTableInternal(compress_relid, list_make1(cmd), true);
+}
+
 /*
  * enables compression for the passed in table by
  * creating a compression hypertable with special properties
@@ -957,19 +984,8 @@ tsl_process_compress_table(AlterTableCmd *cmd, Hypertable *ht,
 	Oid ownerid;
 	List *segmentby_cols;
 	List *orderby_cols;
-	ContinuousAggHypertableStatus caggstat;
 	List *constraint_list = NIL;
 
-	/*check this is not a special internally created hypertable
-	 * i.e. continuous agg table or compression hypertable
-	 */
-	caggstat = ts_continuous_agg_hypertable_status(ht->fd.id);
-	if (!(caggstat == HypertableIsRawTable || caggstat == HypertableIsNotContinuousAgg))
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("continuous aggregates do not support compression")));
-	}
 	if (TS_HYPERTABLE_IS_INTERNAL_COMPRESSION_TABLE(ht))
 	{
 		ereport(ERROR,
@@ -1063,6 +1079,38 @@ tsl_process_compress_table_add_column(Hypertable *ht, ColumnDef *orig_def)
 	}
 	/* add catalog entries for the new column for the hypertable */
 	compresscolinfo_add_catalog_entries(&compress_cols, orig_htid);
+}
+
+/* Drop a column from a table that has compression enabled
+ * This function specifically removes it from the internal compression table
+ * and removes it from metadata.
+ * Removing orderby or segmentby columns is not supported.
+ */
+void
+tsl_process_compress_table_drop_column(Hypertable *ht, char *name)
+{
+	Assert(TS_HYPERTABLE_HAS_COMPRESSION_TABLE(ht) || TS_HYPERTABLE_HAS_COMPRESSION_ENABLED(ht));
+	FormData_hypertable_compression *ht_comp =
+		ts_hypertable_compression_get_by_pkey(ht->fd.id, name);
+
+	/* With DROP COLUMN IF EXISTS we might end up being called
+	 * for non-existant columns. */
+	if (!ht_comp)
+		return;
+
+	if (ht_comp->segmentby_column_index > 0 || ht_comp->orderby_column_index > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot drop orderby or segmentby column from a hypertable with "
+						"compression enabled")));
+
+	if (TS_HYPERTABLE_HAS_COMPRESSION_TABLE(ht))
+	{
+		Hypertable *compress_ht = ts_hypertable_get_by_id(ht->fd.compressed_hypertable_id);
+		drop_column_from_compression_table(compress_ht, name);
+	}
+
+	ts_hypertable_compression_delete_by_pkey(ht->fd.id, name);
 }
 
 /* Rename a column on a hypertable that has compression enabled.

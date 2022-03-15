@@ -15,7 +15,7 @@
 #include <catalog/pg_type.h>
 
 #include "bgw_policy/chunk_stats.h"
-#include "catalog.h"
+#include "ts_catalog/catalog.h"
 #include "chunk.h"
 #include "chunk_constraint.h"
 #include "dimension.h"
@@ -24,7 +24,7 @@
 #include "hypertable.h"
 #include "scanner.h"
 
-#include "compat.h"
+#include "compat/compat.h"
 
 /* Put DIMENSION_SLICE_MAXVALUE point in same slice as DIMENSION_SLICE_MAXVALUE-1, always */
 /* This avoids the problem with coord < range_end where coord and range_end is an int64 */
@@ -616,17 +616,25 @@ ts_dimension_slice_scan_for_existing(const DimensionSlice *slice, const ScanTupL
 		CurrentMemoryContext);
 }
 
+DimensionSlice *
+ts_dimension_slice_from_tuple(TupleInfo *ti)
+{
+	DimensionSlice *slice;
+	MemoryContext old;
+
+	lock_result_ok_or_abort(ti);
+	old = MemoryContextSwitchTo(ti->mctx);
+	slice = dimension_slice_from_slot(ti->slot);
+	MemoryContextSwitchTo(old);
+
+	return slice;
+}
+
 static ScanTupleResult
 dimension_slice_tuple_found(TupleInfo *ti, void *data)
 {
 	DimensionSlice **slice = data;
-	MemoryContext old;
-
-	lock_result_ok_or_abort(ti);
-
-	old = MemoryContextSwitchTo(ti->mctx);
-	*slice = dimension_slice_from_slot(ti->slot);
-	MemoryContextSwitchTo(old);
+	*slice = ts_dimension_slice_from_tuple(ti);
 	return SCAN_DONE;
 }
 
@@ -659,6 +667,43 @@ ts_dimension_slice_scan_by_id_and_lock(int32 dimension_slice_id, const ScanTupLo
 										mctx);
 
 	return slice;
+}
+
+ScanIterator
+ts_dimension_slice_scan_iterator_create(MemoryContext result_mcxt)
+{
+	ScanIterator it = ts_scan_iterator_create(DIMENSION_SLICE, AccessShareLock, result_mcxt);
+	it.ctx.index = catalog_get_index(ts_catalog_get(), DIMENSION_SLICE, DIMENSION_SLICE_ID_IDX);
+	it.ctx.flags |= SCANNER_F_NOEND_AND_NOCLOSE;
+
+	return it;
+}
+
+void
+ts_dimension_slice_scan_iterator_set_slice_id(ScanIterator *it, int32 slice_id,
+											  const ScanTupLock *tuplock)
+{
+	ts_scan_iterator_scan_key_reset(it);
+	ts_scan_iterator_scan_key_init(it,
+								   Anum_dimension_slice_id_idx_id,
+								   BTEqualStrategyNumber,
+								   F_INT4EQ,
+								   Int32GetDatum(slice_id));
+	it->ctx.tuplock = tuplock;
+}
+
+DimensionSlice *
+ts_dimension_slice_scan_iterator_get_by_id(ScanIterator *it, int32 slice_id,
+										   const ScanTupLock *tuplock)
+{
+	TupleInfo *ti;
+
+	ts_dimension_slice_scan_iterator_set_slice_id(it, slice_id, tuplock);
+	ts_scan_iterator_start_or_restart_scan(it);
+	ti = ts_scan_iterator_next(it);
+	Assert(ti);
+	Assert(ts_scan_iterator_next(it) == NULL);
+	return ts_dimension_slice_from_tuple(ti);
 }
 
 DimensionSlice *
@@ -920,7 +965,8 @@ ts_dimension_slice_oldest_valid_chunk_for_reorder(int32 job_id, int32 dimension_
 
 typedef struct CompressChunkSearch
 {
-	int32 chunk_id;
+	List *chunk_ids; /* list of chunk ids that match search */
+	int32 maxchunks; /*max number of chunks to return */
 	bool compress;
 	bool recompress;
 } CompressChunkSearch;
@@ -945,22 +991,25 @@ dimension_slice_check_is_chunk_uncompressed_tuple_found(TupleInfo *ti, void *dat
 			/* found a chunk that is not compressed or needs recompress
 			 * caller needs to check the correct chunk status
 			 */
-			d->chunk_id = chunk_id;
-			return SCAN_DONE;
+			d->chunk_ids = lappend_int(d->chunk_ids, chunk_id);
+			if (d->maxchunks > 0 && list_length(d->chunk_ids) >= d->maxchunks)
+				return SCAN_DONE;
 		}
 	}
 
 	return SCAN_CONTINUE;
 }
 
-int32
-ts_dimension_slice_get_chunkid_to_compress(int32 dimension_id, StrategyNumber start_strategy,
-										   int64 start_value, StrategyNumber end_strategy,
-										   int64 end_value, bool compress, bool recompress)
+List *
+ts_dimension_slice_get_chunkids_to_compress(int32 dimension_id, StrategyNumber start_strategy,
+											int64 start_value, StrategyNumber end_strategy,
+											int64 end_value, bool compress, bool recompress,
+											int32 numchunks)
 {
 	CompressChunkSearch data = { .compress = compress,
 								 .recompress = recompress,
-								 .chunk_id = INVALID_CHUNK_ID };
+								 .chunk_ids = NIL,
+								 .maxchunks = numchunks > 0 ? numchunks : -1 };
 	dimension_slice_scan_with_strategies(dimension_id,
 										 start_strategy,
 										 start_value,
@@ -971,5 +1020,5 @@ ts_dimension_slice_get_chunkid_to_compress(int32 dimension_id, StrategyNumber st
 										 -1,
 										 NULL);
 
-	return data.chunk_id;
+	return data.chunk_ids;
 }

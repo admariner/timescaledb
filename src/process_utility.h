@@ -10,7 +10,7 @@
 #include <nodes/plannodes.h>
 #include <tcop/utility.h>
 #include "hypertable_cache.h"
-#include "compat.h"
+#include "compat/compat.h"
 
 typedef struct ProcessUtilityArgs
 {
@@ -28,6 +28,9 @@ typedef struct ProcessUtilityArgs
 	QueryCompletion *completion_tag;
 #else
 	char *completion_tag;
+#endif
+#if PG14_GE
+	bool readonly_tree;
 #endif
 } ProcessUtilityArgs;
 

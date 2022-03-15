@@ -3,6 +3,7 @@
  * Please see the included NOTICE for copyright information and
  * LICENSE-TIMESCALE for a copy of the license.
  */
+
 /* This file contains the code for processing continuous aggregate
  * DDL statements which are of the form:
  *
@@ -11,7 +12,7 @@
  * The entry point for the code is
  * tsl_process_continuous_agg_viewstmt
  * The bulk of the code that creates the underlying tables/views etc. is in
- * cagg_create
+ * cagg_create.
  *
  */
 #include <postgres.h>
@@ -57,8 +58,8 @@
 
 #include "create.h"
 
-#include "catalog.h"
-#include "continuous_agg.h"
+#include "ts_catalog/catalog.h"
+#include "ts_catalog/continuous_agg.h"
 #include "dimension.h"
 #include "extension_constants.h"
 #include "func_cache.h"
@@ -66,12 +67,16 @@
 #include "hypertable.h"
 #include "invalidation.h"
 #include "dimension.h"
-#include "continuous_agg.h"
+#include "ts_catalog/continuous_agg.h"
 #include "options.h"
 #include "time_utils.h"
 #include "utils.h"
 #include "errors.h"
 #include "refresh.h"
+#include "remote/dist_commands.h"
+#include "ts_catalog/hypertable_data_node.h"
+#include "deparse.h"
+#include "timezones.h"
 
 #define FINALFN "finalize_agg"
 #define PARTIALFN "partialize_agg"
@@ -84,9 +89,6 @@
 #define INTERNAL_TO_DATE_FUNCTION "to_date"
 #define INTERNAL_TO_TSTZ_FUNCTION "to_timestamp"
 #define INTERNAL_TO_TS_FUNCTION "to_timestamp_without_timezone"
-
-#define DEFAULT_MAX_INTERVAL_MULTIPLIER 20
-#define DEFAULT_MAX_INTERVAL_MAX_BUCKET_WIDTH (PG_INT64_MAX / DEFAULT_MAX_INTERVAL_MULTIPLIER)
 
 /*switch to ts user for _timescaledb_internal access */
 #define SWITCH_TO_TS_USER(schemaname, newuid, saved_uid, saved_secctx)                             \
@@ -176,7 +178,16 @@ typedef struct CAggTimebucketInfo
 							/* This should also be the column used by time_bucket */
 	Oid htpartcoltype;
 	int64 htpartcol_interval_len; /* interval length setting for primary partitioning column */
-	int64 bucket_width;			  /*bucket_width of time_bucket */
+	int64 bucket_width;			  /* bucket_width of time_bucket, stores BUCKET_WIDHT_VARIABLE for
+									 variable-sized buckets */
+	Interval *interval;			  /* stores the interval, NULL if not specified */
+	const char *timezone;		  /* the name of the timezone, NULL if not specified */
+
+	/*
+	 * Custom origin value stored as UTC timestamp.
+	 * If not specified, stores infinity.
+	 */
+	Timestamp origin;
 } CAggTimebucketInfo;
 
 typedef struct AggPartCxt
@@ -211,7 +222,7 @@ static void finalizequery_init(FinalizeQueryInfo *inp, Query *orig_query,
 							   MatTableColumnInfo *mattblinfo);
 static Query *finalizequery_get_select_query(FinalizeQueryInfo *inp, List *matcollist,
 											 ObjectAddress *mattbladdress);
-static bool is_valid_bucketing_function(Oid funcid);
+static bool function_allowed_in_cagg_definition(Oid funcid);
 
 static Const *cagg_boundary_make_lower_bound(Oid type);
 static Oid cagg_get_boundary_converter_funcoid(Oid typoid);
@@ -261,6 +272,42 @@ create_cagg_catalog_entry(int32 matht_id, int32 rawht_id, const char *user_schem
 		NameGetDatum(&direct_viewnm);
 	values[AttrNumberGetAttrOffset(Anum_continuous_agg_materialize_only)] =
 		BoolGetDatum(materialized_only);
+
+	ts_catalog_database_info_become_owner(ts_catalog_database_info_get(), &sec_ctx);
+	ts_catalog_insert_values(rel, desc, values, nulls);
+	ts_catalog_restore_user(&sec_ctx);
+	table_close(rel, RowExclusiveLock);
+}
+
+/* create a entry for the materialization table in table CONTINUOUS_AGGS_BUCKET_FUNCTION */
+static void
+create_bucket_function_catalog_entry(int32 matht_id, bool experimental, const char *name,
+									 const char *bucket_width, const char *origin,
+									 const char *timezone)
+{
+	Catalog *catalog = ts_catalog_get();
+	Relation rel;
+	TupleDesc desc;
+	Datum values[Natts_continuous_aggs_bucket_function];
+	bool nulls[Natts_continuous_aggs_bucket_function] = { false };
+	CatalogSecurityContext sec_ctx;
+
+	rel = table_open(catalog_get_table_id(catalog, CONTINUOUS_AGGS_BUCKET_FUNCTION),
+					 RowExclusiveLock);
+	desc = RelationGetDescr(rel);
+
+	memset(values, 0, sizeof(values));
+	values[AttrNumberGetAttrOffset(Anum_continuous_agg_mat_hypertable_id)] = matht_id;
+	values[AttrNumberGetAttrOffset(Anum_continuous_aggs_bucket_function_experimental)] =
+		BoolGetDatum(experimental);
+	values[AttrNumberGetAttrOffset(Anum_continuous_aggs_bucket_function_name)] =
+		CStringGetTextDatum(name);
+	values[AttrNumberGetAttrOffset(Anum_continuous_aggs_bucket_function_bucket_width)] =
+		CStringGetTextDatum(bucket_width);
+	values[AttrNumberGetAttrOffset(Anum_continuous_aggs_bucket_function_origin)] =
+		CStringGetTextDatum(origin);
+	values[AttrNumberGetAttrOffset(Anum_continuous_aggs_bucket_function_timezone)] =
+		CStringGetTextDatum(timezone ? timezone : "");
 
 	ts_catalog_database_info_become_owner(ts_catalog_database_info_get(), &sec_ctx);
 	ts_catalog_insert_values(rel, desc, values, nulls);
@@ -341,11 +388,12 @@ check_trigger_exists_hypertable(Oid relid, char *trigname)
 
 /* add continuous agg invalidation trigger to hypertable
  * relid - oid of hypertable
- * trigarg - argument to pass to trigger (the hypertable id from timescaledb catalog as a string)
+ * hypertableid - argument to pass to trigger (the hypertable id from timescaledb catalog)
  */
 static void
-cagg_add_trigger_hypertable(Oid relid, char *trigarg)
+cagg_add_trigger_hypertable(Oid relid, int32 hypertable_id)
 {
+	char hypertable_id_str[12];
 	ObjectAddress objaddr;
 	char *relname = get_rel_name(relid);
 	Oid schemaid = get_rel_namespace(relid);
@@ -353,7 +401,7 @@ cagg_add_trigger_hypertable(Oid relid, char *trigarg)
 	Cache *hcache;
 	Hypertable *ht;
 
-	CreateTrigStmt stmt = {
+	CreateTrigStmt stmt_template = {
 		.type = T_CreateTrigStmt,
 		.row = true,
 		.timing = TRIGGER_TYPE_AFTER,
@@ -361,13 +409,53 @@ cagg_add_trigger_hypertable(Oid relid, char *trigarg)
 		.relation = makeRangeVar(schema, relname, -1),
 		.funcname =
 			list_make2(makeString(INTERNAL_SCHEMA_NAME), makeString(CAGG_INVALIDATION_TRIGGER)),
-		.args = list_make1(makeString(trigarg)),
+		.args = NIL, /* to be filled in later */
 		.events = TRIGGER_TYPE_INSERT | TRIGGER_TYPE_UPDATE | TRIGGER_TYPE_DELETE,
 	};
 	if (check_trigger_exists_hypertable(relid, CAGGINVAL_TRIGGER_NAME))
 		return;
 	ht = ts_hypertable_cache_get_cache_and_entry(relid, CACHE_FLAG_NONE, &hcache);
-	objaddr = ts_hypertable_create_trigger(ht, &stmt, NULL);
+	if (hypertable_is_distributed(ht))
+	{
+		DistCmdResult *result;
+		List *data_node_list = ts_hypertable_get_data_node_name_list(ht);
+		List *cmd_descriptors = NIL; /* same order as ht->data_nodes */
+		DistCmdDescr *cmd_descr_data = NULL;
+		ListCell *cell;
+
+		unsigned i = 0;
+		cmd_descr_data = palloc(list_length(data_node_list) * sizeof(*cmd_descr_data));
+		foreach (cell, ht->data_nodes)
+		{
+			HypertableDataNode *node = lfirst(cell);
+			char node_hypertable_id_str[12];
+			CreateTrigStmt remote_stmt = stmt_template;
+
+			pg_ltoa(node->fd.node_hypertable_id, node_hypertable_id_str);
+			pg_ltoa(node->fd.hypertable_id, hypertable_id_str);
+
+			remote_stmt.args =
+				list_make2(makeString(node_hypertable_id_str), makeString(hypertable_id_str));
+			cmd_descr_data[i].sql = deparse_create_trigger(&remote_stmt);
+			cmd_descr_data[i].params = NULL;
+			cmd_descriptors = lappend(cmd_descriptors, &cmd_descr_data[i++]);
+		}
+
+		result =
+			ts_dist_multi_cmds_params_invoke_on_data_nodes(cmd_descriptors, data_node_list, true);
+		if (result)
+			ts_dist_cmd_close_response(result);
+		/*
+		 * FALL-THROUGH
+		 * We let the Access Node create a trigger as well, even though it is not used for data
+		 * modifications. We use the Access Node trigger as a check for existence of the remote
+		 * triggers.
+		 */
+	}
+	CreateTrigStmt local_stmt = stmt_template;
+	pg_ltoa(hypertable_id, hypertable_id_str);
+	local_stmt.args = list_make1(makeString(hypertable_id_str));
+	objaddr = ts_hypertable_create_trigger(ht, &local_stmt, NULL);
 	if (!OidIsValid(objaddr.objectId))
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
@@ -465,7 +553,7 @@ mattablecolumninfo_create_materialization_table(MatTableColumnInfo *matcolinfo, 
 	int32 mat_htid;
 	Oid mat_relid;
 	Cache *hcache;
-	Hypertable *mat_ht = NULL;
+	Hypertable *mat_ht = NULL, *orig_ht = NULL;
 	Oid owner = GetUserId();
 
 	create = makeNode(CreateStmt);
@@ -509,8 +597,8 @@ mattablecolumninfo_create_materialization_table(MatTableColumnInfo *matcolinfo, 
 	 * invalid. Add an infinite invalidation for the continuous
 	 * aggregate. This is the initial state of the aggregate before any
 	 * refreshes. */
-	invalidation_cagg_log_add_entry(mat_htid, TS_TIME_NOBEGIN, TS_TIME_NOEND);
-
+	orig_ht = ts_hypertable_cache_get_entry(hcache, origquery_tblinfo->htoid, CACHE_FLAG_NONE);
+	continuous_agg_invalidate_mat_ht(orig_ht, mat_ht, TS_TIME_NOBEGIN, TS_TIME_NOEND);
 	ts_cache_release(hcache);
 	return mat_htid;
 }
@@ -591,17 +679,28 @@ caggtimebucketinfo_init(CAggTimebucketInfo *src, int32 hypertable_id, Oid hypert
 	src->htpartcolno = hypertable_partition_colno;
 	src->htpartcoltype = hypertable_partition_coltype;
 	src->htpartcol_interval_len = hypertable_partition_col_interval;
-	src->bucket_width = 0; /*invalid value */
+	src->bucket_width = 0;			/* invalid value */
+	src->interval = NULL;			/* not specified by default */
+	src->timezone = NULL;			/* not specified by default */
+	TIMESTAMP_NOBEGIN(src->origin); /* origin is not specified by default */
 }
 
-/* Check if the group-by clauses has exactly 1 time_bucket(.., <col>)
- * where <col> is the hypertable's partitioning column.
+/*
+ * Check if the group-by clauses has exactly 1 time_bucket(.., <col>) where
+ * <col> is the hypertable's partitioning column and other invariants. Then fill
+ * the `bucket_width` and other fields of `tbinfo`.
  */
 static void
 caggtimebucket_validate(CAggTimebucketInfo *tbinfo, List *groupClause, List *targetList)
 {
 	ListCell *l;
 	bool found = false;
+
+	/* Make sure tbinfo was initialized. This assumption is used below. */
+	Assert(tbinfo->bucket_width == 0);
+	Assert(tbinfo->timezone == NULL);
+	Assert(TIMESTAMP_NOT_FINITE(tbinfo->origin));
+
 	foreach (l, groupClause)
 	{
 		SortGroupClause *sgc = (SortGroupClause *) lfirst(l);
@@ -611,8 +710,9 @@ caggtimebucket_validate(CAggTimebucketInfo *tbinfo, List *groupClause, List *tar
 			FuncExpr *fe = ((FuncExpr *) tle->expr);
 			Node *width_arg;
 			Node *col_arg;
+			Node *tz_arg;
 
-			if (!is_valid_bucketing_function(fe->funcid))
+			if (!function_allowed_in_cagg_definition(fe->funcid))
 				continue;
 
 			if (found)
@@ -632,6 +732,111 @@ caggtimebucket_validate(CAggTimebucketInfo *tbinfo, List *groupClause, List *tar
 						 errmsg(
 							 "time bucket function must reference a hypertable dimension column")));
 
+			if (list_length(fe->args) == 4)
+			{
+				/*
+				 * Timezone and custom origin are specified. In this clause we
+				 * save only the timezone. Origin is processed in the following
+				 * clause.
+				 */
+				tz_arg = eval_const_expressions(NULL, lfourth(fe->args));
+
+				if (!IsA(tz_arg, Const))
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("only immutable expressions allowed in time bucket function"),
+							 errhint("Use an immutable expression as fourth argument"
+									 " to the time bucket function.")));
+
+				Const *tz = castNode(Const, tz_arg);
+
+				/* This is assured by function_allowed_in_cagg_definition() above. */
+				Assert(tz->consttype == TEXTOID);
+				const char *tz_name = TextDatumGetCString(tz->constvalue);
+				if (!ts_is_valid_timezone_name(tz_name))
+				{
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("invalid timezone name \"%s\"", tz_name)));
+				}
+
+				tbinfo->timezone = tz_name;
+				tbinfo->bucket_width = BUCKET_WIDTH_VARIABLE;
+			}
+
+			if (list_length(fe->args) >= 3)
+			{
+				tz_arg = eval_const_expressions(NULL, lthird(fe->args));
+				if (!IsA(tz_arg, Const))
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("only immutable expressions allowed in time bucket function"),
+							 errhint("Use an immutable expression as third argument"
+									 " to the time bucket function.")));
+
+				Const *tz = castNode(Const, tz_arg);
+				if ((tz->consttype == TEXTOID) && (list_length(fe->args) == 3))
+				{
+					/* Timezone specified */
+					const char *tz_name = TextDatumGetCString(tz->constvalue);
+
+					if (!ts_is_valid_timezone_name(tz_name))
+					{
+						ereport(ERROR,
+								(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								 errmsg("invalid timezone name \"%s\"", tz_name)));
+					}
+
+					tbinfo->timezone = tz_name;
+					tbinfo->bucket_width = BUCKET_WIDTH_VARIABLE;
+				}
+				else
+				{
+					/*
+					 * Custom origin specified. This is always treated as
+					 * a variable-sized bucket case.
+					 */
+					tbinfo->bucket_width = BUCKET_WIDTH_VARIABLE;
+
+					if (tz->constisnull)
+					{
+						ereport(ERROR,
+								(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								 errmsg("invalid origin value: null")));
+					}
+
+					switch (tz->consttype)
+					{
+						case DATEOID:
+							tbinfo->origin = DatumGetTimestamp(
+								DirectFunctionCall1(date_timestamp, tz->constvalue));
+							break;
+						case TIMESTAMPOID:
+							tbinfo->origin = DatumGetTimestamp(tz->constvalue);
+							break;
+						case TIMESTAMPTZOID:
+							tbinfo->origin = DatumGetTimestampTz(tz->constvalue);
+							break;
+						default:
+							/*
+							 * This shouldn't happen. But if somehow it does
+							 * make sure the execution will stop here even in
+							 * the Release build.
+							 */
+							ereport(ERROR,
+									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									 errmsg("unsupported time bucket function")));
+					}
+
+					if (TIMESTAMP_NOT_FINITE(tbinfo->origin))
+					{
+						ereport(ERROR,
+								(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								 errmsg("invalid origin value: infinity")));
+					}
+				}
+			}
+
 			/*
 			 * We constify width expression here so any immutable expression will be allowed
 			 * otherwise it would make it harder to create caggs for hypertables with e.g. int8
@@ -642,9 +847,19 @@ caggtimebucket_validate(CAggTimebucketInfo *tbinfo, List *groupClause, List *tar
 			if (IsA(width_arg, Const))
 			{
 				Const *width = castNode(Const, width_arg);
+				if (width->consttype == INTERVALOID)
+				{
+					tbinfo->interval = DatumGetIntervalP(width->constvalue);
+					if (tbinfo->interval->month != 0)
+						tbinfo->bucket_width = BUCKET_WIDTH_VARIABLE;
+				}
 
-				tbinfo->bucket_width =
-					ts_interval_value_to_internal(width->constvalue, width->consttype);
+				if (tbinfo->bucket_width != BUCKET_WIDTH_VARIABLE)
+				{
+					/* The bucket size is fixed */
+					tbinfo->bucket_width =
+						ts_interval_value_to_internal(width->constvalue, width->consttype);
+				}
 			}
 			else
 				ereport(ERROR,
@@ -652,6 +867,53 @@ caggtimebucket_validate(CAggTimebucketInfo *tbinfo, List *groupClause, List *tar
 						 errmsg("only immutable expressions allowed in time bucket function"),
 						 errhint("Use an immutable expression as first argument"
 								 " to the time bucket function.")));
+
+			if ((tbinfo->bucket_width == BUCKET_WIDTH_VARIABLE) && (tbinfo->interval->month != 0))
+			{
+				/* Monthly buckets case */
+				if (!TIMESTAMP_NOT_FINITE(tbinfo->origin))
+				{
+					/*
+					 * Origin was specified - make sure it's the first day of the month.
+					 * If a timezone was specified the check should be done in this timezone.
+					 */
+					Timestamp origin = tbinfo->origin;
+					if (tbinfo->timezone != NULL)
+					{
+						/* The code is equal to 'timestamptz AT TIME ZONE tzname'. */
+						origin = DatumGetTimestamp(
+							DirectFunctionCall2(timestamptz_zone,
+												CStringGetTextDatum(tbinfo->timezone),
+												TimestampTzGetDatum((TimestampTz) origin)));
+					}
+
+					const char *day =
+						TextDatumGetCString(DirectFunctionCall2(timestamp_to_char,
+																TimestampGetDatum(origin),
+																CStringGetTextDatum("DD")));
+					if (strcmp(day, "01") != 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								 errmsg("for monthly buckets origin must be the first day of the "
+										"month")));
+				}
+			}
+		}
+	}
+
+	if (tbinfo->bucket_width == BUCKET_WIDTH_VARIABLE)
+	{
+		/* variable-sized buckets can be used only with intervals */
+		Assert(tbinfo->interval != NULL);
+
+		if ((tbinfo->interval->month != 0) &&
+			((tbinfo->interval->day != 0) || (tbinfo->interval->time != 0)))
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("invalid interval specified"),
+					 errhint("Use either months or days and hours, but not months, days and hours "
+							 "together")));
 		}
 	}
 
@@ -703,6 +965,115 @@ cagg_agg_validate(Node *node, void *context)
 	return expression_tree_walker(node, cagg_agg_validate, context);
 }
 
+/*
+ * Check query and extract error details and error hints.
+ *
+ * Returns:
+ *   True if the query is supported, false otherwise with hints and errors
+ *   added.
+ */
+static bool
+cagg_query_supported(Query *query, StringInfo hint, StringInfo detail)
+{
+	if (query->commandType != CMD_SELECT)
+	{
+		appendStringInfoString(hint, "Use a SELECT query in the continuous aggregate view.");
+		return false;
+	}
+
+	if (query->hasWindowFuncs)
+	{
+		appendStringInfoString(detail,
+							   "Window functions are not supported by continuous aggregates.");
+		return false;
+	}
+
+	if (query->hasDistinctOn || query->distinctClause)
+	{
+		appendStringInfoString(detail,
+							   "DISTINCT / DISTINCT ON queries are not supported by continuous "
+							   "aggregates.");
+		return false;
+	}
+
+	if (query->limitOffset || query->limitCount)
+	{
+		appendStringInfoString(detail,
+							   "LIMIT and LIMIT OFFSET are not supported in queries defining "
+							   "continuous aggregates.");
+		appendStringInfoString(hint,
+							   "Use LIMIT and LIMIT OFFSET in SELECTS from the continuous "
+							   "aggregate view instead.");
+		return false;
+	}
+
+	if (query->sortClause)
+	{
+		appendStringInfoString(detail,
+							   "ORDER BY is not supported in queries defining continuous "
+							   "aggregates.");
+		appendStringInfoString(hint,
+							   "Use ORDER BY clauses in SELECTS from the continuous aggregate view "
+							   "instead.");
+		return false;
+	}
+
+	if (query->hasRecursive || query->hasSubLinks || query->hasTargetSRFs || query->cteList)
+	{
+		appendStringInfoString(detail,
+							   "CTEs, subqueries and set-returning functions are not supported by "
+							   "continuous aggregates.");
+		return false;
+	}
+
+	if (query->hasForUpdate || query->hasModifyingCTE)
+	{
+		appendStringInfoString(detail,
+							   "Data modification is not allowed in continuous aggregate view "
+							   "definitions.");
+		return false;
+	}
+
+	if (query->hasRowSecurity)
+	{
+		appendStringInfoString(detail,
+							   "Row level security is not supported by continuous aggregate "
+							   "views.");
+		return false;
+	}
+
+	if (query->groupingSets)
+	{
+		appendStringInfoString(detail,
+							   "GROUP BY GROUPING SETS, ROLLUP and CUBE are not supported by "
+							   "continuous aggregates");
+		appendStringInfoString(hint,
+							   "Define multiple continuous aggregates with different grouping "
+							   "levels.");
+		return false;
+	}
+
+	if (query->setOperations)
+	{
+		appendStringInfoString(detail,
+							   "UNION, EXCEPT & INTERSECT are not supported by continuous "
+							   "aggregates");
+		return false;
+	}
+
+	if (!query->groupClause)
+	{
+		/*query can have aggregate without group by , so look
+		 * for groupClause*/
+		appendStringInfoString(hint,
+							   "Include at least one aggregate function"
+							   " and a GROUP BY clause with time bucket.");
+		return false;
+	}
+
+	return true; /* Query was OK and is supported */
+}
+
 static CAggTimebucketInfo
 cagg_validate_query(Query *query)
 {
@@ -712,34 +1083,18 @@ cagg_validate_query(Query *query)
 	RangeTblRef *rtref = NULL;
 	RangeTblEntry *rte;
 	List *fromList;
+	StringInfo hint = makeStringInfo();
+	StringInfo detail = makeStringInfo();
 
-	if (query->commandType != CMD_SELECT)
+	if (!cagg_query_supported(query, hint, detail))
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("invalid continuous aggregate query"),
-				 errhint("Use a SELECT query in the continuous aggregate view.")));
+				 hint->len > 0 ? errhint("%s", hint->data) : 0,
+				 detail->len > 0 ? errdetail("%s", detail->data) : 0));
 	}
-	if (query->hasWindowFuncs || query->hasSubLinks || query->hasDistinctOn ||
-		query->hasRecursive || query->hasModifyingCTE || query->hasForUpdate ||
-		query->hasRowSecurity || query->hasTargetSRFs || query->cteList || query->groupingSets ||
-		query->distinctClause || query->setOperations || query->limitOffset || query->limitCount ||
-		query->sortClause)
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("invalid continuous aggregate view")));
-	}
-	if (!query->groupClause)
-	{
-		/*query can have aggregate without group by , so look
-		 * for groupClause*/
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("invalid continuous aggregate view"),
-				 errhint("Include at least one aggregate function"
-						 " and a GROUP BY clause with time bucket.")));
-	}
+
 	/*validate aggregates allowed */
 	cagg_agg_validate((Node *) query->targetList, NULL);
 	cagg_agg_validate((Node *) query->havingQual, NULL);
@@ -767,10 +1122,10 @@ cagg_validate_query(Query *query)
 
 		ht = ts_hypertable_cache_get_cache_and_entry(rte->relid, CACHE_FLAG_NONE, &hcache);
 
-		if (hypertable_is_distributed(ht))
+		if (TS_HYPERTABLE_IS_INTERNAL_COMPRESSION_TABLE(ht))
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("continuous aggregates not supported on distributed hypertables")));
+					 errmsg("hypertable is an internal compressed hypertable")));
 
 		/* there can only be one continuous aggregate per table */
 		switch (ts_continuous_agg_hypertable_status(ht->fd.id))
@@ -1063,25 +1418,17 @@ get_partialize_funcexpr(Aggref *agg)
 }
 
 /*
- * check if the supplied oid belongs to a valid bucket function
- * for continuous aggregates
- * We only support 2-arg variants of time_bucket
+ * Check if the supplied OID belongs to a valid bucket function
+ * for continuous aggregates.
  */
 static bool
-is_valid_bucketing_function(Oid funcid)
+function_allowed_in_cagg_definition(Oid funcid)
 {
-	bool is_timescale;
 	FuncInfo *finfo = ts_func_cache_get_bucketing_func(funcid);
-
 	if (finfo == NULL)
-	{
 		return false;
-	}
 
-	is_timescale =
-		(finfo->origin == ORIGIN_TIMESCALE) || (finfo->origin == ORIGIN_TIMESCALE_EXPERIMENTAL);
-
-	return is_timescale && (finfo->nargs == 2);
+	return finfo->allowed_in_cagg_definition;
 }
 
 /*initialize MatTableColumnInfo */
@@ -1146,7 +1493,7 @@ mattablecolumninfo_addentry(MatTableColumnInfo *out, Node *input, int original_q
 			bool timebkt_chk = false;
 
 			if (IsA(tle->expr, FuncExpr))
-				timebkt_chk = is_valid_bucketing_function(((FuncExpr *) tle->expr)->funcid);
+				timebkt_chk = function_allowed_in_cagg_definition(((FuncExpr *) tle->expr)->funcid);
 
 			if (tle->resname)
 				colname = pstrdup(tle->resname);
@@ -1280,6 +1627,25 @@ mattablecolumninfo_addinternal(MatTableColumnInfo *matcolinfo, RangeTblEntry *us
 	matcolinfo->partial_grouplist = lappend(matcolinfo->partial_grouplist, grpcl);
 }
 
+static Aggref *
+add_partialize_column(Aggref *agg_to_partialize, AggPartCxt *cxt)
+{
+	Aggref *newagg;
+	Var *var;
+	/* step 1: create partialize( aggref) column
+	 * for materialization table */
+	var = mattablecolumninfo_addentry(cxt->mattblinfo,
+									  (Node *) agg_to_partialize,
+									  cxt->original_query_resno);
+	cxt->addcol = true;
+	/* step 2: create finalize_agg expr using var
+	 * for the clumn added to the materialization table
+	 */
+	/* This is a var for the column we created */
+	newagg = get_finalize_aggref(agg_to_partialize, var);
+	return newagg;
+}
+
 static Node *
 add_aggregate_partialize_mutator(Node *node, AggPartCxt *cxt)
 {
@@ -1294,96 +1660,95 @@ add_aggregate_partialize_mutator(Node *node, AggPartCxt *cxt)
 	 */
 	if (IsA(node, Aggref))
 	{
-		Aggref *newagg;
-		Var *var;
-
 		if (cxt->ignore_aggoid == ((Aggref *) node)->aggfnoid)
 			return node; /*don't process this further */
 
-		/* step 1: create partialize( aggref) column
-		 * for materialization table */
-		var = mattablecolumninfo_addentry(cxt->mattblinfo, node, cxt->original_query_resno);
-		cxt->addcol = true;
-		/* step 2: create finalize_agg expr using var
-		 * for the clumn added to the materialization table
-		 */
-		/* This is a var for the column we created */
-		newagg = get_finalize_aggref((Aggref *) node, var);
+		Aggref *newagg = add_partialize_column((Aggref *) node, cxt);
 		return (Node *) newagg;
 	}
 	return expression_tree_mutator(node, add_aggregate_partialize_mutator, cxt);
 }
 
-/* This code modifies modquery */
-/* having clause needs transformation
- * original query is
- * select a, count(b), min(c)
- * from ..
- * group by a
- * having a> 10 or count(b) > 20 or min(d) = 4
- * we get a mat table
- * a, partial(countb), partial(minc) after processing
- * the target list. We need to add entries from the having clause
- * so the modified mat table is
- * a, partial(count), partial(minc), partial(mind)
- * and the new select from the mat table is
- * i.e. we have
- * select col1, finalize(col2), finalize(col3)
- * from ..
- * group by col1
- * having col1 > 10 or finalize(col2) > 20 or finalize(col4) = 4
- * Note: col# = corresponding column from the mat table
- */
 typedef struct Cagg_havingcxt
 {
-	TargetEntry *old;
-	TargetEntry *new;
-	bool found;
+	List *origq_tlist;
+	List *finalizeq_tlist;
+	AggPartCxt agg_cxt;
 } cagg_havingcxt;
 
-/* if we find a target entry  expr that matches the node , then replace it with the
- * expression from  new target entry.
+/* This function modifies the passed in havingQual by mapping exprs to
+ * columns in materialization table or finalized aggregate form.
+ * Note that HAVING clause can contain only exprs from group-by or aggregates
+ * and GROUP BY clauses cannot be aggregates.
+ * (By the time we process havingQuals, all the group by exprs have been
+ * processed and have associated columns in the materialization hypertable).
+ * Example, if  the original query has
+ * GROUP BY  colA + colB, colC
+ *   HAVING colA + colB + sum(colD) > 10 OR count(colE) = 10
+ *
+ * The transformed havingqual would be
+ * HAVING   matCol3 + finalize_agg( sum(matCol4) > 10
+ *       OR finalize_agg( count(matCol5)) = 10
+ *
+ *
+ * Note: GROUP BY exprs always appear in the query's targetlist.
+ * Some of the aggregates from the havingQual  might also already appear in the targetlist.
+ * We replace all existing entries with their corresponding entry from the modified targetlist.
+ * If an aggregate (in the havingqual) does not exist in the TL, we create a
+ *  materialization table column for it and use the finalize(column) form in the
+ * transformed havingQual.
  */
 static Node *
-replace_having_qual_mutator(Node *node, cagg_havingcxt *cxt)
+create_replace_having_qual_mutator(Node *node, cagg_havingcxt *cxt)
 {
 	if (node == NULL)
 		return NULL;
-	if (equal(node, cxt->old->expr))
-	{
-		cxt->found = true;
-		return (Node *) cxt->new->expr;
-	}
-	return expression_tree_mutator(node, replace_having_qual_mutator, cxt);
-}
-
-/* modify the havingqual and replace exprs that already occur in targetlist
- * with entries from new target list
- * RETURNS: havingQual
- */
-static Node *
-replace_targetentry_in_havingqual(Query *origquery, List *newtlist)
-{
-	Node *having = copyObject(origquery->havingQual);
-	List *origtlist = origquery->targetList;
-	List *modtlist = newtlist;
-	ListCell *lc, *lc2;
-	cagg_havingcxt hcxt;
-
-	/* if we have any exprs that are in the targetlist, then we already have columns
-	 * for them in the mat table. So replace with the correct expr
+	/* See if we already have a column in materialization hypertable for this
+	 * expr. We do this by checking the existing targetlist
+	 * entries for the query.
 	 */
+	ListCell *lc, *lc2;
+	List *origtlist = cxt->origq_tlist;
+	List *modtlist = cxt->finalizeq_tlist;
 	forboth (lc, origtlist, lc2, modtlist)
 	{
 		TargetEntry *te = (TargetEntry *) lfirst(lc);
 		TargetEntry *modte = (TargetEntry *) lfirst(lc2);
-		hcxt.old = te;
-		hcxt.new = modte;
-		hcxt.found = false;
-		having =
-			(Node *) expression_tree_mutator((Node *) having, replace_having_qual_mutator, &hcxt);
+		if (equal(node, te->expr))
+		{
+			return (Node *) modte->expr;
+		}
 	}
-	return having;
+	/* didn't find a match in targetlist. If it is an aggregate, create a partialize column for
+	 * it in materialization hypertable and return corresponding finalize
+	 * expr.
+	 */
+	if (IsA(node, Aggref))
+	{
+		AggPartCxt *agg_cxt = &(cxt->agg_cxt);
+		agg_cxt->addcol = false;
+		Aggref *newagg = add_partialize_column((Aggref *) node, agg_cxt);
+		Assert(agg_cxt->addcol == true);
+		return (Node *) newagg;
+	}
+	return expression_tree_mutator(node, create_replace_having_qual_mutator, cxt);
+}
+
+static Node *
+finalizequery_create_havingqual(FinalizeQueryInfo *inp, MatTableColumnInfo *mattblinfo)
+{
+	Query *orig_query = inp->final_userquery;
+	if (orig_query->havingQual == NULL)
+		return NULL;
+	Node *havingQual = copyObject(orig_query->havingQual);
+	Assert(inp->final_seltlist != NULL);
+	cagg_havingcxt hcxt = { .origq_tlist = orig_query->targetList,
+							.finalizeq_tlist = inp->final_seltlist,
+							.agg_cxt.mattblinfo = mattblinfo,
+							.agg_cxt.original_query_resno = 0,
+							.agg_cxt.ignore_aggoid = get_finalizefnoid(),
+							.agg_cxt.addcol = false };
+	return create_replace_having_qual_mutator(havingQual, &hcxt);
 }
 
 /*
@@ -1402,7 +1767,6 @@ finalizequery_init(FinalizeQueryInfo *inp, Query *orig_query, MatTableColumnInfo
 {
 	AggPartCxt cxt;
 	ListCell *lc;
-	Node *newhavingQual;
 	int resno = 1;
 
 	inp->final_userquery = copyObject(orig_query);
@@ -1467,14 +1831,7 @@ finalizequery_init(FinalizeQueryInfo *inp, Query *orig_query, MatTableColumnInfo
 	}
 	/* all grouping clause elements are in targetlist already.
 	   so let's check the having clause */
-	newhavingQual = replace_targetentry_in_havingqual(inp->final_userquery, inp->final_seltlist);
-	/* we might still have aggs in havingqual which don't appear in the targetlist , but don't
-	 * overwrite finalize_agg exprs that we have in the havingQual*/
-	cxt.addcol = false;
-	cxt.ignore_aggoid = get_finalizefnoid();
-	cxt.original_query_resno = 0;
-	inp->final_havingqual =
-		expression_tree_mutator((Node *) newhavingQual, add_aggregate_partialize_mutator, &cxt);
+	inp->final_havingqual = finalizequery_create_havingqual(inp, mattblinfo);
 }
 
 /* Create select query with the finalize aggregates
@@ -1500,12 +1857,12 @@ finalizequery_get_select_query(FinalizeQueryInfo *inp, List *matcollist,
 	rte->relkind = RELKIND_RELATION;
 	rte->tablesample = NULL;
 	rte->eref->colnames = NIL;
+	rte->selectedCols = NULL;
 	/* aliases for column names for the materialization table*/
 	foreach (lc, matcollist)
 	{
 		ColumnDef *cdef = (ColumnDef *) lfirst(lc);
-		Value *attrname = makeString(cdef->colname);
-		rte->eref->colnames = lappend(rte->eref->colnames, attrname);
+		rte->eref->colnames = lappend(rte->eref->colnames, makeString(cdef->colname));
 		rte->selectedCols =
 			bms_add_member(rte->selectedCols,
 						   list_length(rte->eref->colnames) - FirstLowInvalidHeapAttributeNumber);
@@ -1583,7 +1940,7 @@ fixup_userview_query_tlist(Query *userquery, List *tlist_aliases)
  *
  * Step 1. create a materialiation table which stores the partials for the
  * aggregates and the grouping columns + internal columns.
- * So we have a table like ts_internal_mcagg_tab
+ * So we have a table like _materialization_hypertable
  * with columns:
  *( a, col1, col2, col3, internal-columns)
  * where col1 =  partialize(min(b)), col2= partialize(max(d)),
@@ -1593,7 +1950,7 @@ fixup_userview_query_tlist(Query *userquery, List *tlist_aliases)
  * CREATE VIEW mcagg
  * as
  * select a, finalize( col1) + finalize(col2))
- * from ts_internal_mcagg
+ * from _materialization_hypertable
  * group by a, col3
  *
  * Step 3: Create a view to populate the materialization table
@@ -1644,8 +2001,6 @@ cagg_create(const CreateTableAsStmt *create_stmt, ViewStmt *stmt, Query *panquer
 	Oid nspid;
 	RangeVar *part_rel = NULL, *mat_rel = NULL, *dum_rel = NULL;
 	int32 materialize_hypertable_id;
-	char trigarg[NAMEDATALEN];
-	int ret;
 	bool materialized_only =
 		DatumGetBool(with_clause_options[ContinuousViewOptionMaterializedOnly].parsed);
 
@@ -1714,6 +2069,7 @@ cagg_create(const CreateTableAsStmt *create_stmt, ViewStmt *stmt, Query *panquer
 	create_view_for_query(orig_userview_query, dum_rel);
 	/* Step 4 add catalog table entry for the objects we just created */
 	nspid = RangeVarGetCreationNamespace(stmt->view);
+
 	create_cagg_catalog_entry(materialize_hypertable_id,
 							  origquery_ht->htid,
 							  get_namespace_name(nspid), /*schema name for user view */
@@ -1725,13 +2081,44 @@ cagg_create(const CreateTableAsStmt *create_stmt, ViewStmt *stmt, Query *panquer
 							  dum_rel->schemaname,
 							  dum_rel->relname);
 
+	if (origquery_ht->bucket_width == BUCKET_WIDTH_VARIABLE)
+	{
+		const char *bucket_width;
+		const char *origin = "";
+
+		/*
+		 * Variable-sized buckets work only with intervals.
+		 */
+		Assert(origquery_ht->interval != NULL);
+		bucket_width = DatumGetCString(
+			DirectFunctionCall1(interval_out, IntervalPGetDatum(origquery_ht->interval)));
+
+		if (!TIMESTAMP_NOT_FINITE(origquery_ht->origin))
+		{
+			origin = DatumGetCString(
+				DirectFunctionCall1(timestamp_out, TimestampGetDatum(origquery_ht->origin)));
+		}
+
+		/*
+		 * `experimental` = true and `name` = "time_bucket_ng" are hardcoded
+		 * rather than extracted from the query. We happen to know that
+		 * monthly buckets can currently be created only with time_bucket_ng(),
+		 * thus these values are correct. Besides, they are not used for
+		 * anything except Assert's yet for the same reasons. Once the design
+		 * of variable-sized buckets is finalized we will have a better idea
+		 * of what schema is needed exactly. Until then the choice was made
+		 * in favor of the most generic schema that can be optimized later.
+		 */
+		create_bucket_function_catalog_entry(materialize_hypertable_id,
+											 true,
+											 "time_bucket_ng",
+											 bucket_width,
+											 origin,
+											 origquery_ht->timezone);
+	}
+
 	/* Step 5 create trigger on raw hypertable -specified in the user view query*/
-	ret = snprintf(trigarg, NAMEDATALEN, "%d", origquery_ht->htid);
-	if (ret < 0 || ret >= NAMEDATALEN)
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("bad argument to continuous aggregate trigger")));
-	cagg_add_trigger_hypertable(origquery_ht->htoid, trigarg);
+	cagg_add_trigger_hypertable(origquery_ht->htoid, origquery_ht->htid);
 
 	return;
 }
@@ -1771,6 +2158,13 @@ tsl_process_continuous_agg_viewstmt(Node *node, const char *query_string, void *
 							 " first or use another name.")));
 		}
 	}
+	if (!with_clause_options[ContinuousViewOptionCompress].is_default)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot enable compression while creating a continuous aggregate"),
+				 errhint("Use ALTER MATERIALIZED VIEW to enable compression.")));
+	}
 
 	timebucket_exprinfo = cagg_validate_query((Query *) stmt->into->viewQuery);
 	cagg_create(stmt, &viewstmt, (Query *) stmt->query, &timebucket_exprinfo, with_clause_options);
@@ -1787,14 +2181,29 @@ tsl_process_continuous_agg_viewstmt(Node *node, const char *query_string, void *
 
 		/* We are creating a refresh window here in a similar way to how it's
 		 * done in continuous_agg_refresh. We do not call the PG function
-		 * directly since we want to be able to surpress the output in that
+		 * directly since we want to be able to suppress the output in that
 		 * function and adding a 'verbose' parameter to is not useful for a
 		 * user. */
 		relid = get_relname_relid(stmt->into->rel->relname, nspid);
 		cagg = ts_continuous_agg_find_by_relid(relid);
 		Assert(cagg != NULL);
 		refresh_window.type = cagg->partition_type;
-		refresh_window.start = ts_time_get_min(refresh_window.type);
+		/*
+		 * To determine inscribed/circumscribed refresh window for variable-sized
+		 * buckets we should be able to calculate time_bucket(window.begin) and
+		 * time_bucket(window.end). This, however, is not possible in general case.
+		 * As an example, the minimum date is 4714-11-24 BC, which is before any
+		 * reasonable default `origin` value. Thus for variable-sized buckets
+		 * instead of minimum date we use -infinity since time_bucket(-infinity)
+		 * is well-defined as -infinity.
+		 *
+		 * For more details see:
+		 * - ts_compute_inscribed_bucketed_refresh_window_variable()
+		 * - ts_compute_circumscribed_bucketed_refresh_window_variable()
+		 */
+		refresh_window.start = ts_continuous_agg_bucket_width_variable(cagg) ?
+								   ts_time_get_nobegin(refresh_window.type) :
+								   ts_time_get_min(refresh_window.type);
 		refresh_window.end = ts_time_get_noend_or_max(refresh_window.type);
 
 		continuous_agg_refresh_internal(cagg, &refresh_window, CAGG_REFRESH_CREATION);
@@ -1806,8 +2215,7 @@ tsl_process_continuous_agg_viewstmt(Node *node, const char *query_string, void *
  * update the view definition of an existing continuous aggregate
  */
 void
-cagg_update_view_definition(ContinuousAgg *agg, Hypertable *mat_ht,
-							WithClauseResult *with_clause_options)
+cagg_update_view_definition(ContinuousAgg *agg, Hypertable *mat_ht)
 {
 	ListCell *lc1, *lc2;
 	int sec_ctx;
@@ -1844,7 +2252,7 @@ cagg_update_view_definition(ContinuousAgg *agg, Hypertable *mat_ht,
 
 	Query *view_query = finalizequery_get_select_query(&fqi, mattblinfo.matcollist, &mataddress);
 
-	if (with_clause_options[ContinuousViewOptionMaterializedOnly].parsed == BoolGetDatum(false))
+	if (!agg->data.materialized_only)
 		view_query = build_union_query(&timebucket_exprinfo,
 									   &mattblinfo,
 									   view_query,
@@ -1860,8 +2268,6 @@ cagg_update_view_definition(ContinuousAgg *agg, Hypertable *mat_ht,
 	 * relation and update the resource name in the query target list to match
 	 * the name in the user view.
 	 */
-	Assert(list_length(view_query->targetList) == list_length(user_query->targetList));
-
 	TupleDesc desc = RelationGetDescr(user_view_rel);
 	int i = 0;
 	forboth (lc1, view_query->targetList, lc2, user_query->targetList)
@@ -1870,6 +2276,13 @@ cagg_update_view_definition(ContinuousAgg *agg, Hypertable *mat_ht,
 		FormData_pg_attribute *attr = TupleDescAttr(desc, i);
 		view_tle = lfirst_node(TargetEntry, lc1);
 		user_tle = lfirst_node(TargetEntry, lc2);
+		if (view_tle->resjunk && user_tle->resjunk)
+			break;
+		else if (view_tle->resjunk || user_tle->resjunk)
+			/* This should never happen but if it ever does it's safer to
+			 * error here instead of creating broken view definitions. */
+			elog(ERROR, "inconsistent view definitions");
+
 		view_tle->resname = user_tle->resname = NameStr(attr->attname);
 		++i;
 	}

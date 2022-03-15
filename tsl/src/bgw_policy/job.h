@@ -15,6 +15,9 @@
 #include "continuous_aggs/materialize.h"
 #include "bgw_policy/chunk_stats.h"
 
+/* Add config keys common across job types here */
+#define CONFIG_KEY_VERBOSE_LOG "verbose_log" /*used only by compression now*/
+
 typedef struct PolicyReorderData
 {
 	Hypertable *hypertable;
@@ -48,7 +51,6 @@ typedef void (*reorder_func)(Oid tableOid, Oid indexOid, bool verbose, Oid wait_
 extern bool policy_reorder_execute(int32 job_id, Jsonb *config);
 extern bool policy_retention_execute(int32 job_id, Jsonb *config);
 extern bool policy_refresh_cagg_execute(int32 job_id, Jsonb *config);
-extern bool policy_compression_execute(int32 job_id, Jsonb *config);
 extern bool policy_recompression_execute(int32 job_id, Jsonb *config);
 extern void policy_reorder_read_and_validate_config(Jsonb *config, PolicyReorderData *policy_data);
 extern void policy_retention_read_and_validate_config(Jsonb *config,
@@ -60,5 +62,6 @@ extern void policy_compression_read_and_validate_config(Jsonb *config,
 extern void policy_recompression_read_and_validate_config(Jsonb *config,
 														  PolicyCompressionData *policy_data);
 extern bool job_execute(BgwJob *job);
+extern void job_config_check(Name proc_schema, Name proc_name, Jsonb *config);
 
 #endif /* TIMESCALEDB_TSL_BGW_POLICY_JOB_H */

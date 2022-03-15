@@ -8,16 +8,12 @@
 #include <utils/builtins.h>
 #include <utils/timestamp.h>
 
-#include "catalog.h"
-#include "metadata.h"
-#include "telemetry/uuid.h"
+#include "ts_catalog/catalog.h"
+#include "ts_catalog/metadata.h"
+#include "uuid.h"
 #include "telemetry/telemetry_metadata.h"
 #include "scan_iterator.h"
 #include "jsonb_utils.h"
-
-#define METADATA_UUID_KEY_NAME "uuid"
-#define METADATA_EXPORTED_UUID_KEY_NAME "exported_uuid"
-#define METADATA_TIMESTAMP_KEY_NAME "install_timestamp"
 
 /*
  * add all entries from _timescaledb_catalog.metadata
@@ -57,54 +53,4 @@ ts_telemetry_metadata_add_values(JsonbParseState *state)
 			}
 		}
 	}
-}
-
-static Datum
-get_uuid_by_key(const char *key)
-{
-	bool isnull;
-	Datum uuid;
-
-	uuid = ts_metadata_get_value(CStringGetDatum(key), CSTRINGOID, UUIDOID, &isnull);
-
-	if (isnull)
-		uuid = ts_metadata_insert(CStringGetDatum(key),
-								  CSTRINGOID,
-								  UUIDPGetDatum(ts_uuid_create()),
-								  UUIDOID,
-								  true);
-	return uuid;
-}
-
-Datum
-ts_telemetry_metadata_get_uuid(void)
-{
-	return get_uuid_by_key(METADATA_UUID_KEY_NAME);
-}
-
-Datum
-ts_telemetry_metadata_get_exported_uuid(void)
-{
-	return get_uuid_by_key(METADATA_EXPORTED_UUID_KEY_NAME);
-}
-
-Datum
-ts_telemetry_metadata_get_install_timestamp(void)
-{
-	bool isnull;
-	Datum timestamp;
-
-	timestamp = ts_metadata_get_value(CStringGetDatum(METADATA_TIMESTAMP_KEY_NAME),
-									  CSTRINGOID,
-									  TIMESTAMPTZOID,
-									  &isnull);
-
-	if (isnull)
-		timestamp = ts_metadata_insert(CStringGetDatum(METADATA_TIMESTAMP_KEY_NAME),
-									   CSTRINGOID,
-									   TimestampTzGetDatum(GetCurrentTimestamp()),
-									   TIMESTAMPTZOID,
-									   true);
-
-	return timestamp;
 }

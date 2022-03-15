@@ -245,3 +245,30 @@ WHERE indisclustered = true ORDER BY 1;
 \set ON_ERROR_STOP 0
 SELECT reorder_chunk('_timescaledb_internal._hyper_2_3_chunk', verbose => TRUE);
 \set ON_ERROR_STOP 1
+
+-- #3651 incorrect index attribute mapping in reorder_chunk
+CREATE TABLE i3651(c1 timestamptz NOT NULL,c2 text, c3 text, c4 text);
+SELECT table_name FROM create_hypertable('i3651','c1');
+ALTER TABLE i3651 drop column c2;
+CREATE UNIQUE INDEX i3651_attmap ON i3651(c1,c4);
+INSERT INTO i3651 VALUES('2000-01-01','foo','foo'),('2000-01-01','foo','bar');
+SELECT reorder_chunk(chunk,'i3651_attmap') from show_chunks('i3651') chunk;
+
+-- test error handling when trying to create on internal hypertable
+CREATE TABLE comp_ht_test(time timestamptz NOT NULL);
+SELECT table_name FROM create_hypertable('comp_ht_test','time');
+ALTER TABLE comp_ht_test SET (timescaledb.compress);
+
+SELECT
+  format('%I.%I', ht.schema_name, ht.table_name) AS "INTERNALTABLE"
+FROM
+  _timescaledb_catalog.hypertable ht
+  INNER JOIN _timescaledb_catalog.hypertable uncompress ON (ht.id = uncompress.compressed_hypertable_id
+      AND uncompress.table_name = 'comp_ht_test') \gset
+
+\c :TEST_DBNAME :ROLE_SUPERUSER
+CREATE INDEX internal_idx ON :INTERNALTABLE(_ts_meta_min_1);
+\set ON_ERROR_STOP 0
+SELECT add_reorder_policy(:'INTERNALTABLE','internal_idx');
+\set ON_ERROR_STOP 1
+

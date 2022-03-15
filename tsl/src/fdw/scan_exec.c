@@ -19,6 +19,8 @@
 #include "scan_exec.h"
 #include "utils.h"
 #include "remote/data_fetcher.h"
+#include "remote/row_by_row_fetcher.h"
+#include "remote/cursor_fetcher.h"
 #include "guc.h"
 
 /*
@@ -41,8 +43,6 @@ enum FdwScanPrivateIndex
 	FdwScanPrivateServerId,
 	/* OID list of chunk oids, used by EXPLAIN */
 	FdwScanPrivateChunkOids,
-	/* Places in the remote query that need to have the current timestamp inserted */
-	FdwScanCurrentTimeIndexes,
 	/*
 	 * String describing join i.e. names of relations being joined and types
 	 * of join, added when the scan is join
@@ -128,11 +128,28 @@ create_data_fetcher(ScanState *ss, TsFdwScanState *fsstate)
 
 	oldcontext = MemoryContextSwitchTo(econtext->ecxt_per_query_memory);
 
-	fetcher = data_fetcher_create_for_scan(fsstate->conn,
-										   ss,
-										   fsstate->retrieved_attrs,
-										   fsstate->query,
-										   params);
+	if (fsstate->fetcher_type == CursorFetcherType)
+	{
+		fetcher = cursor_fetcher_create_for_scan(fsstate->conn,
+												 ss,
+												 fsstate->retrieved_attrs,
+												 fsstate->query,
+												 params);
+	}
+	else
+	{
+		/*
+		 * The fetcher type must have been determined by the planner at this
+		 * point, so we shouldn't see 'auto' here.
+		 */
+		Assert(fsstate->fetcher_type == RowByRowFetcherType);
+		fetcher = row_by_row_fetcher_create_for_scan(fsstate->conn,
+													 ss,
+													 fsstate->retrieved_attrs,
+													 fsstate->query,
+													 params);
+	}
+
 	fsstate->fetcher = fetcher;
 	MemoryContextSwitchTo(oldcontext);
 
@@ -193,43 +210,6 @@ fdw_scan_debug_override_current_timestamp(TimestampTz time)
 }
 #endif
 
-/*
- * This function takes a sql statement char string and list of indicies to occurrences of `now()`
- * within that string and then returns a new string which will be the same sql statement, only with
- * the now calls replaced with the current transaction timestamp.
- */
-static char *
-generate_updated_sql_using_current_timestamp(const char *original_sql, List *now_indicies)
-{
-	static const char string_to_replace[] = "now()";
-	int replace_length = strlen(string_to_replace);
-	StringInfoData new_query;
-	ListCell *lc;
-	int curr_index = 0;
-	TimestampTz now;
-
-	initStringInfo(&new_query);
-	now = GetSQLCurrentTimestamp(-1);
-#ifdef TS_DEBUG
-	if (ts_current_timestamp_override_value >= 0)
-		now = ts_current_timestamp_override_value;
-#endif
-
-	foreach (lc, now_indicies)
-	{
-		int next_index = lfirst_int(lc);
-
-		Assert(next_index < strlen(original_sql) &&
-			   strncmp(string_to_replace, original_sql + next_index, replace_length) == 0);
-		appendBinaryStringInfo(&new_query, original_sql + curr_index, next_index - curr_index);
-		appendStringInfo(&new_query, "('%s'::timestamptz)", timestamptz_to_str(now));
-		curr_index = next_index + replace_length;
-	}
-
-	appendStringInfo(&new_query, "%s", original_sql + curr_index);
-	return new_query.data;
-}
-
 static TSConnection *
 get_connection(ScanState *ss, Oid const server_id, Bitmapset *scanrelids, List *exprs)
 {
@@ -278,14 +258,7 @@ fdw_scan_init(ScanState *ss, TsFdwScanState *fsstate, Bitmapset *scanrelids, Lis
 								   fdw_exprs);
 
 	/* Get private info created by planner functions. */
-	if (list_nth(fdw_private, FdwScanCurrentTimeIndexes) == NIL)
-		fsstate->query = strVal(list_nth(fdw_private, FdwScanPrivateSelectSql));
-	else
-		fsstate->query =
-			generate_updated_sql_using_current_timestamp(strVal(list_nth(fdw_private,
-																		 FdwScanPrivateSelectSql)),
-														 list_nth(fdw_private,
-																  FdwScanCurrentTimeIndexes));
+	fsstate->query = strVal(list_nth(fdw_private, FdwScanPrivateSelectSql));
 	fsstate->retrieved_attrs = (List *) list_nth(fdw_private, FdwScanPrivateRetrievedAttrs);
 	fsstate->fetch_size = intVal(list_nth(fdw_private, FdwScanPrivateFetchSize));
 
@@ -433,6 +406,23 @@ get_data_node_explain(const char *sql, TSConnection *conn, ExplainState *es)
 	return buf->data;
 }
 
+static char *
+explain_fetcher_type(DataFetcherType type)
+{
+	switch (type)
+	{
+		case AutoFetcherType:
+			return "Auto";
+		case RowByRowFetcherType:
+			return "Row by row";
+		case CursorFetcherType:
+			return "Cursor";
+		default:
+			Assert(false);
+			return "";
+	}
+}
+
 void
 fdw_scan_explain(ScanState *ss, List *fdw_private, ExplainState *es, TsFdwScanState *fsstate)
 {
@@ -460,6 +450,10 @@ fdw_scan_explain(ScanState *ss, List *fdw_private, ExplainState *es, TsFdwScanSt
 
 		ExplainPropertyText("Data node", server->servername, es);
 
+		/* fsstate can be NULL, so check that first */
+		if (fsstate)
+			ExplainPropertyText("Fetcher Type", explain_fetcher_type(fsstate->fetcher_type), es);
+
 		if (chunk_oids != NIL)
 		{
 			StringInfoData chunk_names;
@@ -479,19 +473,12 @@ fdw_scan_explain(ScanState *ss, List *fdw_private, ExplainState *es, TsFdwScanSt
 			ExplainPropertyText("Chunks", chunk_names.data, es);
 		}
 
-		if (list_nth(fdw_private, FdwScanCurrentTimeIndexes) != NIL)
-			sql =
-				generate_updated_sql_using_current_timestamp(strVal(
-																 list_nth(fdw_private,
-																		  FdwScanPrivateSelectSql)),
-															 list_nth(fdw_private,
-																	  FdwScanCurrentTimeIndexes));
-		else
-			sql = strVal(list_nth(fdw_private, FdwScanPrivateSelectSql));
+		sql = strVal(list_nth(fdw_private, FdwScanPrivateSelectSql));
 
 		ExplainPropertyText("Remote SQL", sql, es);
 
-		if (ts_guc_enable_remote_explain)
+		/* fsstate should be set up but better check again to avoid crashes */
+		if (ts_guc_enable_remote_explain && fsstate)
 		{
 			const char *data_node_explain =
 				get_data_node_explain(fsstate->query, fsstate->conn, es);

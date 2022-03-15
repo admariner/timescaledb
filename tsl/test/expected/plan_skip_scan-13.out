@@ -2724,16 +2724,16 @@ ordered append on skip_scan_ht
                ->  Index Only Scan using _hyper_1_1_chunk_skip_scan_ht_time_dev_idx on _hyper_1_1_chunk (actual rows=250 loops=1)
                      Index Cond: (("time" > NULL::integer) AND ("time" >= 0) AND ("time" <= 5000))
                      Heap Fetches: 250
-         ->  Custom Scan (SkipScan) on _hyper_1_4_chunk (actual rows=250 loops=1)
-               ->  Index Only Scan using _hyper_1_4_chunk_skip_scan_ht_time_dev_idx on _hyper_1_4_chunk (actual rows=250 loops=1)
-                     Index Cond: (("time" > NULL::integer) AND ("time" >= 0) AND ("time" <= 5000))
-                     Heap Fetches: 250
          ->  Custom Scan (SkipScan) on _hyper_1_2_chunk (actual rows=250 loops=1)
                ->  Index Only Scan using _hyper_1_2_chunk_skip_scan_ht_time_dev_idx on _hyper_1_2_chunk (actual rows=250 loops=1)
                      Index Cond: (("time" > NULL::integer) AND ("time" >= 0) AND ("time" <= 5000))
                      Heap Fetches: 250
          ->  Custom Scan (SkipScan) on _hyper_1_3_chunk (actual rows=250 loops=1)
                ->  Index Only Scan using _hyper_1_3_chunk_skip_scan_ht_time_dev_idx on _hyper_1_3_chunk (actual rows=250 loops=1)
+                     Index Cond: (("time" > NULL::integer) AND ("time" >= 0) AND ("time" <= 5000))
+                     Heap Fetches: 250
+         ->  Custom Scan (SkipScan) on _hyper_1_4_chunk (actual rows=250 loops=1)
+               ->  Index Only Scan using _hyper_1_4_chunk_skip_scan_ht_time_dev_idx on _hyper_1_4_chunk (actual rows=250 loops=1)
                      Index Cond: (("time" > NULL::integer) AND ("time" >= 0) AND ("time" <= 5000))
                      Heap Fetches: 250
 (19 rows)
@@ -2873,14 +2873,14 @@ WHERE CLAUSES
                      ->  Custom Scan (SkipScan) on _hyper_1_1_chunk (actual rows=11 loops=1)
                            ->  Index Scan using _hyper_1_1_chunk_skip_scan_ht_dev_time_idx on _hyper_1_1_chunk (actual rows=11 loops=1)
                                  Index Cond: ("time" > 5)
-                     ->  Custom Scan (SkipScan) on _hyper_1_4_chunk (actual rows=11 loops=1)
-                           ->  Index Scan using _hyper_1_4_chunk_skip_scan_ht_dev_time_idx on _hyper_1_4_chunk (actual rows=11 loops=1)
-                                 Index Cond: ("time" > 5)
                      ->  Custom Scan (SkipScan) on _hyper_1_2_chunk (actual rows=11 loops=1)
                            ->  Index Scan using _hyper_1_2_chunk_skip_scan_ht_dev_time_idx on _hyper_1_2_chunk (actual rows=11 loops=1)
                                  Index Cond: ("time" > 5)
                      ->  Custom Scan (SkipScan) on _hyper_1_3_chunk (actual rows=11 loops=1)
                            ->  Index Scan using _hyper_1_3_chunk_skip_scan_ht_dev_time_idx on _hyper_1_3_chunk (actual rows=11 loops=1)
+                                 Index Cond: ("time" > 5)
+                     ->  Custom Scan (SkipScan) on _hyper_1_4_chunk (actual rows=11 loops=1)
+                           ->  Index Scan using _hyper_1_4_chunk_skip_scan_ht_dev_time_idx on _hyper_1_4_chunk (actual rows=11 loops=1)
                                  Index Cond: ("time" > 5)
 (17 rows)
 
@@ -3145,16 +3145,16 @@ WHERE CLAUSES
                ->  Index Only Scan using _hyper_1_1_chunk_skip_scan_ht_dev_time_idx on _hyper_1_1_chunk (actual rows=5 loops=1)
                      Index Cond: ((dev > NULL::integer) AND (dev > 5) AND ("time" > 200))
                      Heap Fetches: 5
-         ->  Custom Scan (SkipScan) on _hyper_1_4_chunk (actual rows=5 loops=1)
-               ->  Index Scan using _hyper_1_4_chunk_skip_scan_ht_dev_idx on _hyper_1_4_chunk (actual rows=5 loops=1)
-                     Index Cond: (dev > 5)
-                     Filter: ("time" > 200)
          ->  Custom Scan (SkipScan) on _hyper_1_2_chunk (actual rows=5 loops=1)
                ->  Index Scan using _hyper_1_2_chunk_skip_scan_ht_dev_idx on _hyper_1_2_chunk (actual rows=5 loops=1)
                      Index Cond: (dev > 5)
                      Filter: ("time" > 200)
          ->  Custom Scan (SkipScan) on _hyper_1_3_chunk (actual rows=5 loops=1)
                ->  Index Scan using _hyper_1_3_chunk_skip_scan_ht_dev_idx on _hyper_1_3_chunk (actual rows=5 loops=1)
+                     Index Cond: (dev > 5)
+                     Filter: ("time" > 200)
+         ->  Custom Scan (SkipScan) on _hyper_1_4_chunk (actual rows=5 loops=1)
+               ->  Index Scan using _hyper_1_4_chunk_skip_scan_ht_dev_idx on _hyper_1_4_chunk (actual rows=5 loops=1)
                      Index Cond: (dev > 5)
                      Filter: ("time" > 200)
 (19 rows)
@@ -3908,4 +3908,59 @@ EXPLAIN (costs off, timing off, summary off) SELECT DISTINCT ON (dev_name) dev_n
                ->  Index Only Scan using _hyper_1_4_chunk_skip_scan_ht_dev_name_idx on _hyper_1_4_chunk
                      Index Cond: (dev_name > NULL::text)
 (15 rows)
+
+-- #3629 skipscan with constant skipscan column in where clause
+CREATE TABLE i3629(a int, time timestamptz NOT NULL);
+SELECT table_name FROM create_hypertable('i3629', 'time');
+ table_name 
+------------
+ i3629
+(1 row)
+
+INSERT INTO i3629 SELECT i, '2020-04-01'::date-10-i from generate_series(1,20) i;
+EXPLAIN (SUMMARY OFF, COSTS OFF) SELECT DISTINCT ON (a) * FROM i3629 WHERE a in (2) ORDER BY a ASC, time DESC;
+                   QUERY PLAN                   
+------------------------------------------------
+ Unique
+   ->  Sort
+         Sort Key: _hyper_3_6_chunk."time" DESC
+         ->  Append
+               ->  Seq Scan on _hyper_3_6_chunk
+                     Filter: (a = 2)
+               ->  Seq Scan on _hyper_3_7_chunk
+                     Filter: (a = 2)
+               ->  Seq Scan on _hyper_3_8_chunk
+                     Filter: (a = 2)
+               ->  Seq Scan on _hyper_3_9_chunk
+                     Filter: (a = 2)
+(12 rows)
+
+SELECT DISTINCT ON (a) * FROM i3629 WHERE a in (2) ORDER BY a ASC, time DESC;
+ a |             time             
+---+------------------------------
+ 2 | Fri Mar 20 00:00:00 2020 PDT
+(1 row)
+
+-- #3720 skipscan not being used on varchar column
+CREATE TABLE i3720(time timestamptz not null,data varchar);
+SELECT table_name FROM create_hypertable('i3720','time');
+ table_name 
+------------
+ i3720
+(1 row)
+
+INSERT INTO i3720
+SELECT time, (array['Yes', 'No', 'Maybe'])[floor(random() * 3 + 1)]
+FROM generate_series('2000-01-01'::timestamptz,'2000-01-03'::timestamptz, '10 minute'::interval) AS g1(time);
+CREATE INDEX ON i3720(data, time);
+ANALYZE i3720;
+:PREFIX SELECT DISTINCT ON(data) * FROM i3720;
+                                                      QUERY PLAN                                                      
+----------------------------------------------------------------------------------------------------------------------
+ Unique (actual rows=3 loops=1)
+   ->  Custom Scan (SkipScan) on _hyper_4_10_chunk (actual rows=3 loops=1)
+         ->  Index Only Scan using _hyper_4_10_chunk_i3720_data_time_idx on _hyper_4_10_chunk (actual rows=3 loops=1)
+               Index Cond: (data > NULL::text)
+               Heap Fetches: 3
+(5 rows)
 

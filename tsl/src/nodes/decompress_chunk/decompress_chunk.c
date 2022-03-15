@@ -19,7 +19,9 @@
 #include <utils/lsyscache.h>
 #include <utils/typcache.h>
 
-#include "hypertable_compression.h"
+#include <planner.h>
+
+#include "ts_catalog/hypertable_compression.h"
 #include "import/planner.h"
 #include "compression/create.h"
 #include "nodes/decompress_chunk/decompress_chunk.h"
@@ -181,7 +183,7 @@ build_compressed_scan_pathkeys(SortInfo *sort_info, PlannerInfo *root, List *chu
 			 lc = lnext_compat(chunk_pathkeys, lc))
 		{
 			PathKey *pk = lfirst(lc);
-			var = (Var *) ts_find_em_expr_for_rel(pk->pk_eclass, info->chunk_rel);
+			var = (Var *) find_em_expr_for_rel(pk->pk_eclass, info->chunk_rel);
 
 			if (var == NULL || !IsA(var, Var))
 				/* this should not happen because we validated the pathkeys when creating the path
@@ -279,8 +281,18 @@ build_compressioninfo(PlannerInfo *root, Hypertable *ht, RelOptInfo *chunk_rel)
 	info->chunk_rel = chunk_rel;
 	info->chunk_rte = planner_rt_fetch(chunk_rel->relid, root);
 
-	appinfo = ts_get_appendrelinfo(root, chunk_rel->relid, false);
-	info->ht_rte = planner_rt_fetch(appinfo->parent_relid, root);
+	if (chunk_rel->reloptkind == RELOPT_OTHER_MEMBER_REL)
+	{
+		appinfo = ts_get_appendrelinfo(root, chunk_rel->relid, false);
+		info->ht_rte = planner_rt_fetch(appinfo->parent_relid, root);
+	}
+	else
+	{
+		Assert(chunk_rel->reloptkind == RELOPT_BASEREL);
+		info->single_chunk = true;
+		info->ht_rte = info->chunk_rte;
+	}
+
 	info->hypertable_id = ht->fd.id;
 
 	info->hypertable_compression_info = ts_hypertable_compression_get(ht->fd.id);
@@ -325,12 +337,16 @@ ts_decompress_chunk_generate_paths(PlannerInfo *root, RelOptInfo *chunk_rel, Hyp
 								   Chunk *chunk)
 {
 	RelOptInfo *compressed_rel;
-	RelOptInfo *hypertable_rel;
 	ListCell *lc;
 	double new_row_estimate;
+	Index ht_relid = 0;
 
 	CompressionInfo *info = build_compressioninfo(root, ht, chunk_rel);
-	Index ht_index;
+
+	/* double check we don't end up here on single chunk queries with ONLY */
+	Assert(info->chunk_rel->reloptkind == RELOPT_OTHER_MEMBER_REL ||
+		   (info->chunk_rel->reloptkind == RELOPT_BASEREL &&
+			ts_rte_is_marked_for_expansion(info->chunk_rte)));
 
 	/*
 	 * since we rely on parallel coordination from the scan below
@@ -338,13 +354,7 @@ ts_decompress_chunk_generate_paths(PlannerInfo *root, RelOptInfo *chunk_rel, Hyp
 	 * than a single worker per chunk
 	 */
 	int parallel_workers = 1;
-	AppendRelInfo *chunk_info = ts_get_appendrelinfo(root, chunk_rel->relid, false);
 	SortInfo sort_info = build_sortinfo(chunk, chunk_rel, info, root->query_pathkeys);
-
-	Assert(chunk_info != NULL);
-	Assert(chunk_info->parent_reloid == ht->main_table_relid);
-	ht_index = chunk_info->parent_relid;
-	hypertable_rel = root->simple_rel_array[ht_index];
 
 	Assert(chunk->fd.compressed_chunk_id > 0);
 
@@ -360,8 +370,17 @@ ts_decompress_chunk_generate_paths(PlannerInfo *root, RelOptInfo *chunk_rel, Hyp
 	pushdown_quals(root, chunk_rel, compressed_rel, info->hypertable_compression_info);
 	set_baserel_size_estimates(root, compressed_rel);
 	new_row_estimate = compressed_rel->rows * DECOMPRESS_CHUNK_BATCH_SIZE;
-	/* adjust the parent's estimate by the diff of new and old estimate */
-	hypertable_rel->rows += (new_row_estimate - chunk_rel->rows);
+
+	if (!info->single_chunk)
+	{
+		/* adjust the parent's estimate by the diff of new and old estimate */
+		AppendRelInfo *chunk_info = ts_get_appendrelinfo(root, chunk_rel->relid, false);
+		Assert(chunk_info->parent_reloid == ht->main_table_relid);
+		ht_relid = chunk_info->parent_relid;
+		RelOptInfo *hypertable_rel = root->simple_rel_array[ht_relid];
+		hypertable_rel->rows += (new_row_estimate - chunk_rel->rows);
+	}
+
 	chunk_rel->rows = new_row_estimate;
 	create_compressed_scan_paths(root,
 								 compressed_rel,
@@ -370,7 +389,10 @@ ts_decompress_chunk_generate_paths(PlannerInfo *root, RelOptInfo *chunk_rel, Hyp
 								 &sort_info);
 
 	/* compute parent relids of the chunk and use it to filter paths*/
-	Relids parent_relids = find_childrel_parents(root, chunk_rel);
+	Relids parent_relids = NULL;
+	if (!info->single_chunk)
+		parent_relids = find_childrel_parents(root, chunk_rel);
+
 	/* create non-parallel paths */
 	foreach (lc, compressed_rel->pathlist)
 	{
@@ -455,7 +477,8 @@ ts_decompress_chunk_generate_paths(PlannerInfo *root, RelOptInfo *chunk_rel, Hyp
 			DecompressChunkPath *path;
 			if (child_path->param_info != NULL &&
 				(bms_is_member(chunk_rel->relid, child_path->param_info->ppi_req_outer) ||
-				 bms_is_member(ht_index, child_path->param_info->ppi_req_outer)))
+				 (!info->single_chunk &&
+				  bms_is_member(ht_relid, child_path->param_info->ppi_req_outer))))
 				continue;
 			path = decompress_chunk_path_create(root, info, parallel_workers, child_path);
 			add_partial_path(chunk_rel, &path->cpath.path);
@@ -920,20 +943,7 @@ decompress_chunk_add_plannerinfo(PlannerInfo *root, CompressionInfo *info, Chunk
 	Oid compressed_relid = compressed_chunk->table_id;
 	RelOptInfo *compressed_rel;
 
-	/* repalloc() does not work with NULL argument */
-	Assert(root->simple_rel_array);
-	Assert(root->simple_rte_array);
-	Assert(root->append_rel_array);
-
-	root->simple_rel_array_size++;
-	root->simple_rel_array =
-		repalloc(root->simple_rel_array, root->simple_rel_array_size * sizeof(RelOptInfo *));
-	root->simple_rte_array =
-		repalloc(root->simple_rte_array, root->simple_rel_array_size * sizeof(RangeTblEntry *));
-	root->append_rel_array =
-		repalloc(root->append_rel_array, root->simple_rel_array_size * sizeof(AppendRelInfo *));
-	root->append_rel_array[compressed_index] = NULL;
-
+	expand_planner_arrays(root, 1);
 	info->compressed_rte = decompress_chunk_make_rte(compressed_relid, AccessShareLock);
 	root->simple_rte_array[compressed_index] = info->compressed_rte;
 
@@ -948,7 +958,7 @@ decompress_chunk_add_plannerinfo(PlannerInfo *root, CompressionInfo *info, Chunk
 	 * in generate_join_implied_equalities (called by
 	 * get_baserel_parampathinfo <- create_index_paths)
 	 */
-	Assert(chunk_rel->top_parent_relids != NULL);
+	Assert(info->single_chunk || chunk_rel->top_parent_relids != NULL);
 	compressed_rel->top_parent_relids = bms_copy(chunk_rel->top_parent_relids);
 
 	root->simple_rel_array[compressed_index] = compressed_rel;
@@ -1079,15 +1089,9 @@ decompress_chunk_make_rte(Oid compressed_relid, LOCKMODE lockmode)
 	for (varattno = 0; varattno < r->rd_att->natts; varattno++)
 	{
 		Form_pg_attribute attr = TupleDescAttr(r->rd_att, varattno);
-		Value *attrname;
-
-		if (attr->attisdropped)
-			/* Always insert an empty string for a dropped column */
-			attrname = makeString(pstrdup(""));
-		else
-			attrname = makeString(pstrdup(NameStr(attr->attname)));
-
-		rte->eref->colnames = lappend(rte->eref->colnames, attrname);
+		/* Always insert an empty string for a dropped column */
+		const char *attrname = attr->attisdropped ? "" : NameStr(attr->attname);
+		rte->eref->colnames = lappend(rte->eref->colnames, makeString(pstrdup(attrname)));
 	}
 
 	/*
@@ -1130,25 +1134,6 @@ get_column_compressioninfo(List *hypertable_compression_info, char *column_name)
 	elog(ERROR, "No compression information for column \"%s\" found.", column_name);
 
 	pg_unreachable();
-}
-
-/*
- * find matching column attno for compressed chunk based on hypertable attno
- *
- * since we dont want aliasing to interfere we lookup directly in catalog
- * instead of using RangeTblEntry
- */
-AttrNumber
-get_compressed_attno(CompressionInfo *info, AttrNumber ht_attno)
-{
-	AttrNumber compressed_attno;
-	char *chunk_col = get_attname(info->ht_rte->relid, ht_attno, false);
-	compressed_attno = get_attnum(info->compressed_rte->relid, chunk_col);
-
-	if (compressed_attno == InvalidAttrNumber)
-		elog(ERROR, "No matching column in compressed chunk found.");
-
-	return compressed_attno;
 }
 
 /*
@@ -1256,7 +1241,7 @@ build_sortinfo(Chunk *chunk, RelOptInfo *chunk_rel, CompressionInfo *info, List 
 		{
 			Assert(bms_num_members(segmentby_columns) <= info->num_segmentby_columns);
 			pk = lfirst(lc);
-			expr = ts_find_em_expr_for_rel(pk->pk_eclass, info->chunk_rel);
+			expr = find_em_expr_for_rel(pk->pk_eclass, info->chunk_rel);
 
 			if (expr == NULL || !IsA(expr, Var))
 				break;
@@ -1296,7 +1281,7 @@ build_sortinfo(Chunk *chunk, RelOptInfo *chunk_rel, CompressionInfo *info, List 
 	{
 		bool reverse = false;
 		pk = lfirst(lc);
-		expr = ts_find_em_expr_for_rel(pk->pk_eclass, info->chunk_rel);
+		expr = find_em_expr_for_rel(pk->pk_eclass, info->chunk_rel);
 
 		if (expr == NULL || !IsA(expr, Var))
 			return sort_info;

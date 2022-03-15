@@ -10,12 +10,13 @@
 #include <nodes/primnodes.h>
 #include <utils/array.h>
 
-#include "catalog.h"
+#include "ts_catalog/catalog.h"
 #include "chunk_adaptive.h"
 #include "dimension.h"
 #include "export.h"
 #include "scanner.h"
-#include "tablespace.h"
+#include "scan_iterator.h"
+#include "ts_catalog/tablespace.h"
 
 #define OLD_INSERT_BLOCKER_NAME "insert_blocker"
 #define INSERT_BLOCKER_NAME "ts_insert_blocker"
@@ -69,18 +70,6 @@ enum Anum_create_hypertable
 };
 
 #define Natts_create_hypertable (_Anum_create_hypertable_max - 1)
-
-typedef struct HypertablesStat
-{
-	int num_hypertables_user;
-	int num_hypertables_compressed;
-	int num_hypertables_distributed_members;
-	int num_hypertables_distributed;
-	int num_hypertables_distributed_and_replicated;
-	int num_hypertables_total;
-} HypertablesStat;
-
-extern TSDLLEXPORT void ts_number_of_hypertables(HypertablesStat *stat);
 
 extern TSDLLEXPORT Oid ts_rel_get_owner(Oid relid);
 extern List *ts_hypertable_get_all(void);
@@ -176,6 +165,9 @@ extern TSDLLEXPORT Datum ts_hypertable_get_open_dim_max_value(const Hypertable *
 															  int dimension_index, bool *isnull);
 
 extern TSDLLEXPORT bool ts_hypertable_has_compression_table(const Hypertable *ht);
+extern TSDLLEXPORT void ts_hypertable_formdata_fill(FormData_hypertable *fd, const TupleInfo *ti);
+extern TSDLLEXPORT void ts_hypertable_scan_by_name(ScanIterator *iterator, const char *schema,
+												   const char *name);
 
 #define hypertable_scan(schema, table, tuple_found, data, lockmode, tuplock)                       \
 	ts_hypertable_scan_with_memory_context(schema,                                                 \

@@ -21,7 +21,6 @@ INSERT INTO timestamp_partitioned VALUES('2004-10-19 10:23:54', '10');
 INSERT INTO timestamp_partitioned VALUES('2004-12-19 10:23:54', '30');
 SELECT * FROM chunks_detailed_size('timestamp_partitioned') order by chunk_name;
 
-
 CREATE TABLE timestamp_partitioned_2(time TIMESTAMP, value CHAR(9));
 SELECT * FROM create_hypertable('timestamp_partitioned_2', 'time', 'value', 2);
 
@@ -40,6 +39,7 @@ this must be over 2k. this must be over 2k. this must be over 2k. this must be o
 $$);
 SELECT * FROM chunks_detailed_size('toast_test');
 
+--
 -- Tests for approximate_row_count()
 --
 
@@ -103,7 +103,7 @@ SELECT * FROM approximate_row_count('approx_count_c');
 
 DROP TABLE approx_count CASCADE;
 
--- Regular table with declarative partitioning
+-- table with declarative partitioning
 --
 
 CREATE TABLE approx_count_dp(time TIMESTAMP, value int) PARTITION BY RANGE(time);
@@ -139,6 +139,48 @@ SELECT * FROM approximate_row_count('approx_count_dp0');
 SELECT * FROM approximate_row_count('approx_count_dp1');
 SELECT * FROM approximate_row_count('approx_count_dp2');
 
+CREATE TABLE approx_count_dp_nested(time TIMESTAMP, device_id int, value int) PARTITION BY RANGE(time);
+CREATE TABLE approx_count_dp_nested_0 PARTITION OF approx_count_dp_nested FOR VALUES FROM ('2004-01-01 00:00:00') TO ('2005-01-01 00:00:00') PARTITION BY RANGE (device_id);
+CREATE TABLE approx_count_dp_nested_0_0 PARTITION OF approx_count_dp_nested_0 FOR VALUES FROM (0) TO (10);
+CREATE TABLE approx_count_dp_nested_0_1 PARTITION OF approx_count_dp_nested_0 FOR VALUES FROM (10) TO (20);
+CREATE TABLE approx_count_dp_nested_1 PARTITION OF approx_count_dp_nested FOR VALUES FROM ('2005-01-01 00:00:00') TO ('2006-01-01 00:00:00') PARTITION BY RANGE (device_id);
+CREATE TABLE approx_count_dp_nested_1_0 PARTITION OF approx_count_dp_nested_1 FOR VALUES FROM (0) TO (10);
+CREATE TABLE approx_count_dp_nested_1_1 PARTITION OF approx_count_dp_nested_1 FOR VALUES FROM (10) TO (20);
+
+INSERT INTO approx_count_dp_nested VALUES('2004-01-01 10:00:00', 1, 1);
+INSERT INTO approx_count_dp_nested VALUES('2004-01-01 10:00:00', 2, 1);
+INSERT INTO approx_count_dp_nested VALUES('2004-01-01 10:00:00', 3, 1);
+INSERT INTO approx_count_dp_nested VALUES('2004-01-01 10:00:00', 11, 1);
+INSERT INTO approx_count_dp_nested VALUES('2004-01-01 10:00:00', 12, 1);
+INSERT INTO approx_count_dp_nested VALUES('2004-01-01 10:00:00', 13, 1);
+INSERT INTO approx_count_dp_nested VALUES('2005-01-01 10:00:00', 1, 1);
+INSERT INTO approx_count_dp_nested VALUES('2005-01-01 10:00:00', 2, 1);
+INSERT INTO approx_count_dp_nested VALUES('2005-01-01 10:00:00', 3, 1);
+INSERT INTO approx_count_dp_nested VALUES('2005-01-01 10:00:00', 11, 1);
+INSERT INTO approx_count_dp_nested VALUES('2005-01-01 10:00:00', 12, 1);
+INSERT INTO approx_count_dp_nested VALUES('2005-01-01 10:00:00', 13, 1);
+
+SELECT * FROM approximate_row_count('approx_count_dp_nested');
+ANALYZE approx_count_dp_nested;
+
+SELECT
+  (SELECT count(*) FROM approx_count_dp_nested) AS dp_nested,
+  (SELECT count(*) FROM approx_count_dp_nested_0) AS dp_nested_0,
+  (SELECT count(*) FROM approx_count_dp_nested_0_0) AS dp_nested_0_0,
+  (SELECT count(*) FROM approx_count_dp_nested_0_1) AS dp_nested_0_1,
+  (SELECT count(*) FROM approx_count_dp_nested_1) AS dp_nested_1,
+  (SELECT count(*) FROM approx_count_dp_nested_1_0) AS dp_nested_1_0,
+  (SELECT count(*) FROM approx_count_dp_nested_1_1) AS dp_nested_1_1
+UNION ALL
+SELECT
+  approximate_row_count('approx_count_dp_nested'),
+  approximate_row_count('approx_count_dp_nested_0'),
+  approximate_row_count('approx_count_dp_nested_0_0'),
+  approximate_row_count('approx_count_dp_nested_0_1'),
+  approximate_row_count('approx_count_dp_nested_1'),
+  approximate_row_count('approx_count_dp_nested_1_0'),
+  approximate_row_count('approx_count_dp_nested_1_1');
+
 -- Hypertable
 --
 CREATE TABLE approx_count(time TIMESTAMP, value int);
@@ -171,6 +213,7 @@ SELECT * FROM chunks_detailed_size(0) ORDER BY node_name;
 SELECT * FROM hypertable_compression_stats(0) ORDER BY node_name;
 SELECT * FROM chunk_compression_stats(0) ORDER BY node_name;
 SELECT * FROM hypertable_index_size(0);
+SELECT * FROM _timescaledb_internal.relation_size(0);
 
 SELECT * FROM hypertable_size(1);
 SELECT * FROM hypertable_detailed_size(1) ORDER BY node_name;
@@ -178,6 +221,7 @@ SELECT * FROM chunks_detailed_size(1) ORDER BY node_name;
 SELECT * FROM hypertable_compression_stats(1) ORDER BY node_name;
 SELECT * FROM chunk_compression_stats(1) ORDER BY node_name;
 SELECT * FROM hypertable_index_size(1);
+SELECT * FROM _timescaledb_internal.relation_size(1);
 
 -- Test size functions with NULL input
 SELECT * FROM hypertable_size(NULL);
@@ -186,6 +230,7 @@ SELECT * FROM chunks_detailed_size(NULL) ORDER BY node_name;
 SELECT * FROM hypertable_compression_stats(NULL) ORDER BY node_name;
 SELECT * FROM chunk_compression_stats(NULL) ORDER BY node_name;
 SELECT * FROM hypertable_index_size(NULL);
+SELECT * FROM _timescaledb_internal.relation_size(NULL);
 
 -- Test size functions on regular table
 CREATE TABLE hypersize(time timestamptz, device int);
@@ -194,6 +239,7 @@ CREATE INDEX hypersize_time_idx ON hypersize (time);
 \set VERBOSITY default
 \set SHOW_CONTEXT never
 SELECT pg_relation_size('hypersize'), pg_table_size('hypersize'), pg_indexes_size('hypersize'), pg_total_relation_size('hypersize'), pg_relation_size('hypersize_time_idx');
+SELECT * FROM _timescaledb_internal.relation_size('hypersize');
 SELECT * FROM hypertable_size('hypersize');
 SELECT * FROM hypertable_detailed_size('hypersize') ORDER BY node_name;
 SELECT * FROM chunks_detailed_size('hypersize') ORDER BY node_name;
@@ -206,6 +252,7 @@ SELECT * FROM hypertable_index_size('hypersize_time_idx');
 -- Test size functions on empty hypertable
 SELECT * FROM create_hypertable('hypersize', 'time');
 SELECT pg_relation_size('hypersize'), pg_table_size('hypersize'), pg_indexes_size('hypersize'), pg_total_relation_size('hypersize'), pg_relation_size('hypersize_time_idx');
+SELECT * FROM _timescaledb_internal.relation_size('hypersize');
 SELECT * FROM hypertable_size('hypersize');
 SELECT * FROM hypertable_detailed_size('hypersize') ORDER BY node_name;
 SELECT * FROM chunks_detailed_size('hypersize') ORDER BY node_name;
@@ -219,6 +266,7 @@ SELECT pg_relation_size('hypersize'), pg_table_size('hypersize'), pg_indexes_siz
 SELECT pg_relation_size(ch), pg_table_size(ch), pg_indexes_size(ch), pg_total_relation_size(ch)
 FROM show_chunks('hypersize') ch
 ORDER BY ch;
+SELECT * FROM show_chunks('hypersize') ch JOIN LATERAL _timescaledb_internal.relation_size(ch) ON true;
 SELECT * FROM hypertable_size('hypersize');
 SELECT * FROM hypertable_detailed_size('hypersize') ORDER BY node_name;
 SELECT * FROM chunks_detailed_size('hypersize') ORDER BY node_name;

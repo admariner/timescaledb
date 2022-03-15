@@ -33,6 +33,7 @@
 #include <math.h>
 
 #include "allpaths.h"
+#include "compat/compat.h"
 
 static void set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte);
 
@@ -180,10 +181,12 @@ ts_set_append_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeT
 		if (IS_DUMMY_REL(childrel))
 			continue;
 
-		/* Bubble up childrel's partitioned children. */
+			/* Bubble up childrel's partitioned children. */
+#if PG14_LT
 		if (rel->part_scheme)
 			rel->partitioned_child_rels = list_concat(rel->partitioned_child_rels,
 													  list_copy(childrel->partitioned_child_rels));
+#endif
 
 		/*
 		 * Child is live, so add it to the live_childrels list for use below.
@@ -291,16 +294,16 @@ set_dummy_rel_pathlist(RelOptInfo *rel)
 
 	/* Set up the dummy path */
 	add_path(rel,
-			 (Path *) create_append_path(NULL,
-										 rel,
-										 NIL,
-										 NIL,
-										 NIL,
-										 rel->lateral_relids,
-										 0,
-										 false,
-										 NIL,
-										 -1));
+			 (Path *) create_append_path_compat(NULL,
+												rel,
+												NIL,
+												NIL,
+												NIL,
+												rel->lateral_relids,
+												0,
+												false,
+												NIL,
+												-1));
 
 	/*
 	 * We set the cheapest-path fields immediately, just in case they were
@@ -494,7 +497,7 @@ set_rel_consider_parallel(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte
 
 /* copied from allpaths.c */
 static void
-set_append_rel_size(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte)
+ts_set_append_rel_size(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte)
 {
 	int parentRTindex = rti;
 	bool has_live_children;
@@ -517,8 +520,10 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry
 	 * that when we've created Paths for all the children, the root
 	 * partitioned table's list will contain all such indexes.
 	 */
+#if PG14_LT
 	if (rte->relkind == RELKIND_PARTITIONED_TABLE)
 		rel->partitioned_child_rels = list_make1_int(rti);
+#endif
 
 	/*
 	 * If this is a partitioned baserel, set the consider_partitionwise_join
@@ -848,7 +853,7 @@ ts_set_rel_size(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rt
 	else if (rte->inh)
 	{
 		/* It's an "append relation", process accordingly */
-		set_append_rel_size(root, rel, rti, rte);
+		ts_set_append_rel_size(root, rel, rti, rte);
 	}
 	else
 	{

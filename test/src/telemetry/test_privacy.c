@@ -9,9 +9,9 @@
 #include <fmgr.h>
 #include <miscadmin.h>
 
-#include "compat.h"
+#include "compat/compat.h"
 #include "telemetry/telemetry.h"
-#include "telemetry/uuid.h"
+#include "uuid.h"
 
 TS_FUNCTION_INFO_V1(ts_test_privacy);
 

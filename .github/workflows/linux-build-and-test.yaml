@@ -13,13 +13,14 @@ jobs:
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
-    - uses: actions/checkout@v2
-
-    - id: set-matrix
+    - name: Checkout source code
+      uses: actions/checkout@v2
+    - name: Build matrix
+      id: set-matrix
       run: python scripts/gh_matrix_builder.py ${{ github.event_name }}
 
   regress:
-    name: PG${{ matrix.pg }} ${{ matrix.name }} ${{ matrix.os }}
+    name: PG${{ matrix.pg }}${{ matrix.snapshot }} ${{ matrix.name }} ${{ matrix.os }}
     needs: matrixbuilder
     runs-on: ${{ matrix.os }}
     strategy:
@@ -40,9 +41,13 @@ jobs:
         sudo apt-get update
         sudo apt-get install flex bison lcov systemd-coredump gdb libipc-run-perl libtest-most-perl ${{ matrix.extra_packages }}
 
-    - name: Install macOS Dependencies using Perl
+    - name: Install macOS Dependencies
       if: runner.os == 'macOS'
       run: |
+        # This is needed because GitHub image macos-10.15 version
+        # 20210927.1 did not install OpenSSL so we install openssl
+        # explicitly.
+        brew install openssl
         sudo perl -MCPAN -e "CPAN::Shell->notest('install', 'IPC::Run')"
         sudo perl -MCPAN -e "CPAN::Shell->notest('install', 'Test::Most')"
 
@@ -58,15 +63,20 @@ jobs:
     # leading to a tainted cache
     - name: Cache PostgreSQL ${{ matrix.pg }} ${{ matrix.build_type }}
       id: cache-postgresql
+      if: matrix.snapshot != 'snapshot'
       uses: actions/cache@v2
       with:
         path: ~/${{ env.PG_SRC_DIR }}
         key: ${{ matrix.os }}-postgresql-${{ matrix.pg }}-${{ matrix.cc }}-${{ matrix.build_type }}${{ env.CACHE_SUFFIX }}
 
-    - name: Build PostgreSQL ${{ matrix.pg }} ${{ matrix.build_type }}
+    - name: Build PostgreSQL ${{ matrix.pg }}${{ matrix.snapshot }} ${{ matrix.build_type }}
       if: steps.cache-postgresql.outputs.cache-hit != 'true'
       run: |
-        wget -q -O postgresql.tar.bz2 https://ftp.postgresql.org/pub/source/v${{ matrix.pg }}/postgresql-${{ matrix.pg }}.tar.bz2
+        if [ "${{ matrix.snapshot }}" = "snapshot" ]; then
+          wget -q -O postgresql.tar.bz2 https://ftp.postgresql.org/pub/snapshot/${{ matrix.pg }}/postgresql-${{ matrix.pg }}-snapshot.tar.bz2
+        else
+          wget -q -O postgresql.tar.bz2 https://ftp.postgresql.org/pub/source/v${{ matrix.pg }}/postgresql-${{ matrix.pg }}.tar.bz2
+        fi
         mkdir -p ~/$PG_SRC_DIR
         tar --extract --file postgresql.tar.bz2 --directory ~/$PG_SRC_DIR --strip-components 1
         cd ~/$PG_SRC_DIR
@@ -91,14 +101,14 @@ jobs:
     - name: Test telemetry without OpenSSL
       if: github.event_name != 'pull_request' && runner.os == 'Linux' && matrix.build_type == 'Debug'
       run: |
-        BUILD_DIR=nossl ./bootstrap -DCMAKE_BUILD_TYPE=Debug -DPG_SOURCE_DIR=~/$PG_SRC_DIR -DPG_PATH=~/$PG_INSTALL_DIR -DUSE_OPENSSL=false
+        BUILD_DIR=nossl ./bootstrap -DCMAKE_BUILD_TYPE=Debug -DPG_SOURCE_DIR=~/$PG_SRC_DIR -DPG_PATH=~/$PG_INSTALL_DIR ${{ matrix.tsdb_build_args }} -DUSE_OPENSSL=OFF
         make -j $MAKE_JOBS -C nossl
         make -C nossl install
         make -C nossl regresscheck TESTS=telemetry
 
     - name: Build TimescaleDB
       run: |
-        ./bootstrap -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DPG_SOURCE_DIR=~/$PG_SRC_DIR -DPG_PATH=~/$PG_INSTALL_DIR ${{ matrix.tsdb_build_args }}
+        ./bootstrap -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DPG_SOURCE_DIR=~/$PG_SRC_DIR -DPG_PATH=~/$PG_INSTALL_DIR ${{ matrix.tsdb_build_args }} -DREQUIRE_ALL_TESTS=ON -DLINTER_STRICT=ON
         make -j $MAKE_JOBS -C build
         make -C build install
 

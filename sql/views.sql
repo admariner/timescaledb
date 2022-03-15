@@ -2,8 +2,6 @@
 -- Please see the included NOTICE for copyright information and
 -- LICENSE-APACHE for a copy of the license.
 
-CREATE SCHEMA IF NOT EXISTS timescaledb_information;
-
 -- Convenience view to list all hypertables
 CREATE OR REPLACE VIEW timescaledb_information.hypertables AS
 SELECT ht.schema_name AS hypertable_schema,
@@ -113,6 +111,10 @@ SELECT ht.schema_name AS hypertable_schema,
   cagg.user_view_name AS view_name,
   viewinfo.viewowner AS view_owner,
   cagg.materialized_only,
+  CASE WHEN mat_ht.compressed_hypertable_id IS NOT NULL 
+       THEN TRUE 
+       ELSE FALSE 
+  END AS compression_enabled,
   mat_ht.schema_name AS materialization_hypertable_schema,
   mat_ht.table_name AS materialization_hypertable_name,
   directview.viewdefinition AS view_definition
@@ -134,7 +136,7 @@ FROM _timescaledb_catalog.continuous_agg cagg,
     AND C.relname = cagg.direct_view_name
     AND N.nspname = cagg.direct_view_schema) directview,
   LATERAL (
-    SELECT schema_name, table_name
+    SELECT schema_name, table_name, compressed_hypertable_id 
     FROM _timescaledb_catalog.hypertable
     WHERE cagg.mat_hypertable_id = id) mat_ht
 WHERE cagg.raw_hypertable_id = ht.id;
@@ -293,7 +295,5 @@ WHERE segq.hypertable_id = ht.id
 ORDER BY table_name,
   segmentby_column_index,
   orderby_column_index;
-
-GRANT USAGE ON SCHEMA timescaledb_information TO PUBLIC;
 
 GRANT SELECT ON ALL TABLES IN SCHEMA timescaledb_information TO PUBLIC;

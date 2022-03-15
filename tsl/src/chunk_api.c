@@ -25,22 +25,22 @@
 #include <utils/lsyscache.h>
 #include <utils/syscache.h>
 
-#include <catalog.h>
-#include <compat.h>
-#include <chunk_data_node.h>
-#include <errors.h>
-#include <error_utils.h>
-#include <hypercube.h>
-#include <hypertable_cache.h>
+#include "compat/compat.h"
+#include "chunk.h"
+#include "chunk_api.h"
+#include "data_node.h"
+#include "errors.h"
+#include "error_utils.h"
+#include "hypercube.h"
+#include "hypertable_cache.h"
 
 #include "remote/async.h"
 #include "remote/dist_txn.h"
 #include "remote/stmt_params.h"
 #include "remote/dist_commands.h"
 #include "remote/tuplefactory.h"
-#include "chunk.h"
-#include "chunk_api.h"
-#include "data_node.h"
+#include "ts_catalog/catalog.h"
+#include "ts_catalog/chunk_data_node.h"
 
 /*
  * These values come from the pg_type table.
@@ -555,7 +555,7 @@ chunk_get_single_stats_tuple(Chunk *chunk, TupleDesc tupdesc)
 	Form_pg_class pgcform;
 	Datum values[_Anum_chunk_relstats_max];
 	bool nulls[_Anum_chunk_relstats_max] = { false };
-	float reltuples = 0;
+	Datum reltuples;
 
 	ctup = SearchSysCache1(RELOID, ObjectIdGetDatum(chunk->table_id));
 
@@ -572,8 +572,8 @@ chunk_get_single_stats_tuple(Chunk *chunk, TupleDesc tupdesc)
 		Int32GetDatum(chunk->fd.hypertable_id);
 	values[AttrNumberGetAttrOffset(Anum_chunk_relstats_num_pages)] =
 		Int32GetDatum(pgcform->relpages);
-	reltuples = Float4GetDatum(pgcform->reltuples);
-	values[AttrNumberGetAttrOffset(Anum_chunk_relstats_num_tuples)] = reltuples > 0 ? reltuples : 0;
+	reltuples = Float4GetDatum(pgcform->reltuples > 0 ? pgcform->reltuples : 0);
+	values[AttrNumberGetAttrOffset(Anum_chunk_relstats_num_tuples)] = reltuples;
 	values[AttrNumberGetAttrOffset(Anum_chunk_relstats_num_allvisible)] =
 		Int32GetDatum(pgcform->relallvisible);
 
@@ -757,7 +757,14 @@ collect_colstat_slots(const HeapTuple tuple, const Form_pg_statistic formdata, D
 		slot_collation[i] = ObjectIdGetDatum(((Oid *) &formdata->stacoll1)[i]);
 
 		slotkind[i] = ObjectIdGetDatum(kind);
-		if (kind == InvalidOid)
+
+		/*
+		 * As per comments in pg_statistic_d.h, "kind" codes from 0 - 99 are reserved
+		 * for assignment by the core PostgreSQL project. Beyond that are for PostGIS
+		 * and other projects
+		 */
+#define PG_STATS_KINDS_MAX 99
+		if (kind == InvalidOid || kind > PG_STATS_KINDS_MAX)
 		{
 			nulls[numbers_idx] = true;
 			nulls[values_idx] = true;
@@ -1175,7 +1182,12 @@ chunk_process_remote_colstats_row(StatsProcessContext *ctx, TupleFactory *tf, Tu
 		value_arrays[i] = NULL;
 		valtype_oids[i] = InvalidOid;
 
-		if (slot_kinds[i] == InvalidOid)
+		/*
+		 * As per comments in pg_statistic_d.h, "kind" codes from 0 - 99 are reserved
+		 * for assignment by the core PostgreSQL project. Beyond that are for PostGIS
+		 * and other projects
+		 */
+		if (slot_kinds[i] == InvalidOid || slot_kinds[i] > PG_STATS_KINDS_MAX)
 			continue;
 
 		for (k = 0; k < STRINGS_PER_OP_OID; ++k)

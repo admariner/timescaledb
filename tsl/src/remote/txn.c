@@ -6,6 +6,7 @@
 #include "libpq-fe.h"
 #include <postgres.h>
 #include <access/xact.h>
+#include <storage/procarray.h>
 #include <utils/builtins.h>
 #include <utils/snapmgr.h>
 #include <libpq-fe.h>
@@ -16,7 +17,7 @@
 #include "txn.h"
 #include "connection.h"
 #include "scanner.h"
-#include "catalog.h"
+#include "ts_catalog/catalog.h"
 #include "txn_id.h"
 
 /* This seemingly long timeout matches what postgres_fdw uses. */
@@ -55,15 +56,15 @@ typedef struct RemoteTxn
  *
  * We always use at least REPEATABLE READ in the remote session.
  * This is important even for cases where we use the a single connection to
- * a data node. This is because a single frontend command may cause multiple
- * remote commands to be executed (e.g. a join of two tables on one remote
+ * a data node. This is because a single command from the access node may cause
+ * multiple remote commands to be executed (e.g. a join of two tables on one remote
  * node might not be pushed down and instead two different queries are sent
  * to the remote node, one for each table in the join). Since in READ
  * COMMITED the snapshot is refreshed on each command, the semantics are off
  * when multiple commands are meant to be part of the same one.
  *
- * This isn't great but we have no alternative unless we ensure that each frontend
- * command always translates to one backend query or if we had some other way to
+ * This isn't great but we have no alternative unless we ensure that each access
+ * node command always translates to one data node query or if we had some other way to
  * control which remote queries share a snapshot or when a snapshot is refreshed.
  *
  * NOTE: this does not guarantee any kind of snapshot isolation to different connections
@@ -83,20 +84,51 @@ remote_txn_begin(RemoteTxn *entry, int curlevel)
 	/* Start main transaction if we haven't yet */
 	if (xact_depth == 0)
 	{
-		const char *sql;
+		StringInfoData sql;
+		char *xactReadOnly;
 
 		Assert(remote_connection_get_status(entry->conn) == CONN_IDLE);
 		elog(DEBUG3, "starting remote transaction on connection %p", entry->conn);
 
+		initStringInfo(&sql);
+		appendStringInfo(&sql, "%s", "START TRANSACTION ISOLATION LEVEL");
 		if (IsolationIsSerializable())
-			sql = "START TRANSACTION ISOLATION LEVEL SERIALIZABLE";
+			appendStringInfo(&sql, "%s", " SERIALIZABLE");
 		else
-			sql = "START TRANSACTION ISOLATION LEVEL REPEATABLE READ";
+			appendStringInfo(&sql, "%s", " REPEATABLE READ");
+
+		/*
+		 * Windows MSVC builds have linking issues for GUC variables from postgres for
+		 * use inside this extension. So we use GetConfigOptionByName
+		 */
+		xactReadOnly = GetConfigOptionByName("transaction_read_only", NULL, false);
+
+		/*
+		 * If we are initiating connection from a standby (of an AN for example),
+		 * then the remote connection transaction needs to be also set up as a
+		 * READ ONLY one. This will catch any commands that are sent from the
+		 * read only AN to datanodes but which could have potential read-write
+		 * side effects on data nodes.
+		 *
+		 * Note that when the STANDBY gets promoted then the ongoing transaction
+		 * will remain READ ONLY till its completion. New transactions will be
+		 * suitably READ WRITE. This is a slight change in behavior as compared to
+		 * regular Postgres, but promotion is not a routine activity, so it should
+		 * be acceptable and typically users would be reconnecting to the new
+		 * promoted AN anyways.
+		 *
+		 * Note that the below will also handle the case when primary AN has a
+		 * transaction which does an explicit "BEGIN TRANSACTION READ ONLY;". The
+		 * treatment is the same, mark the remote DN transaction as READ ONLY
+		 */
+		if (strncmp(xactReadOnly, "on", sizeof("on")) == 0)
+			appendStringInfo(&sql, "%s", " READ ONLY");
 
 		remote_connection_xact_transition_begin(entry->conn);
-		remote_connection_cmd_ok(entry->conn, sql);
+		remote_connection_cmd_ok(entry->conn, sql.data);
 		remote_connection_xact_transition_end(entry->conn);
 		xact_depth = remote_connection_xact_depth_inc(entry->conn);
+		pfree(sql.data);
 	}
 	/* If the connection is in COPY mode, then exit out of it */
 	else if (remote_connection_get_status(entry->conn) == CONN_COPY_IN)
@@ -121,13 +153,17 @@ remote_txn_begin(RemoteTxn *entry, int curlevel)
 	}
 }
 
+/*
+ * Check if the access node transaction which is driving the 2PC on the datanodes is
+ * still in progress.
+ */
 bool
-remote_txn_is_still_in_progress(TransactionId frontend_xid)
+remote_txn_is_still_in_progress_on_access_node(TransactionId access_node_xid)
 {
-	if (TransactionIdIsCurrentTransactionId(frontend_xid))
+	if (TransactionIdIsCurrentTransactionId(access_node_xid))
 		elog(ERROR, "checking if a commit is still in progress on same txn");
 
-	return XidInMVCCSnapshot(frontend_xid, GetTransactionSnapshot());
+	return TransactionIdIsInProgress(access_node_xid);
 }
 
 size_t
@@ -700,27 +736,43 @@ persistent_record_tuple_delete(TupleInfo *ti, void *data)
 	return SCAN_CONTINUE;
 }
 
+/* If gid is NULL, then delete all entries belonging to the provided datanode.  */
 int
-remote_txn_persistent_record_delete_for_data_node(Oid foreign_server_oid)
+remote_txn_persistent_record_delete_for_data_node(Oid foreign_server_oid, const char *gid)
 {
 	Catalog *catalog = ts_catalog_get();
 	ScanKeyData scankey[1];
 	ScannerCtx scanctx;
+	int scanidx;
 	ForeignServer *server = GetForeignServer(foreign_server_oid);
 
-	ScanKeyInit(&scankey[0],
-				Anum_remote_txn_data_node_name_idx_data_node_name,
-				BTEqualStrategyNumber,
-				F_NAMEEQ,
-				DirectFunctionCall1(namein, CStringGetDatum(server->servername)));
+	if (gid == NULL)
+	{
+		ScanKeyInit(&scankey[0],
+					Anum_remote_txn_data_node_name_idx_data_node_name,
+					BTEqualStrategyNumber,
+					F_NAMEEQ,
+					CStringGetDatum(server->servername));
+		scanidx = REMOTE_TXN_DATA_NODE_NAME_IDX;
+	}
+	else
+	{
+		ScanKeyInit(&scankey[0],
+					Anum_remote_txn_pkey_idx_remote_transaction_id,
+					BTEqualStrategyNumber,
+					F_TEXTEQ,
+					CStringGetTextDatum(gid));
+		scanidx = REMOTE_TXN_PKEY_IDX;
+	}
 
 	scanctx = (ScannerCtx){
 		.table = catalog->tables[REMOTE_TXN].id,
-		.index = catalog_get_index(catalog, REMOTE_TXN, REMOTE_TXN_DATA_NODE_NAME_IDX),
+		.index = catalog_get_index(catalog, REMOTE_TXN, scanidx),
 		.nkeys = 1,
 		.scankey = scankey,
 		.tuple_found = persistent_record_tuple_delete,
 		.lockmode = RowExclusiveLock,
+		.snapshot = GetTransactionSnapshot(),
 		.scandirection = ForwardScanDirection,
 	};
 

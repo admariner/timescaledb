@@ -11,8 +11,11 @@
 #include "license_guc.h"
 #include "config.h"
 #include "hypertable_cache.h"
+#ifdef USE_TELEMETRY
 #include "telemetry/telemetry.h"
+#endif
 
+#ifdef USE_TELEMETRY
 typedef enum TelemetryLevel
 {
 	TELEMETRY_OFF,
@@ -33,10 +36,12 @@ ts_telemetry_on()
 static const struct config_enum_entry telemetry_level_options[] = {
 	{ "off", TELEMETRY_OFF, false }, { "basic", TELEMETRY_BASIC, false }, { NULL, 0, false }
 };
+#endif
 
 static const struct config_enum_entry remote_data_fetchers[] = {
 	{ "rowbyrow", RowByRowFetcherType, false },
 	{ "cursor", CursorFetcherType, false },
+	{ "auto", AutoFetcherType, false },
 	{ NULL, 0, false }
 };
 
@@ -56,12 +61,14 @@ bool ts_guc_enable_async_append = true;
 TSDLLEXPORT bool ts_guc_enable_skip_scan = true;
 int ts_guc_max_open_chunks_per_insert = 10;
 int ts_guc_max_cached_chunks_per_hypertable = 10;
+#ifdef USE_TELEMETRY
 int ts_guc_telemetry_level = TELEMETRY_DEFAULT;
+char *ts_telemetry_cloud = NULL;
+#endif
 
 TSDLLEXPORT char *ts_guc_license = TS_LICENSE_DEFAULT;
 char *ts_last_tune_time = NULL;
 char *ts_last_tune_version = NULL;
-char *ts_telemetry_cloud = NULL;
 TSDLLEXPORT bool ts_guc_enable_2pc;
 TSDLLEXPORT int ts_guc_max_insert_batch_size = 1000;
 TSDLLEXPORT bool ts_guc_enable_connection_binary_data;
@@ -69,7 +76,7 @@ TSDLLEXPORT bool ts_guc_enable_client_ddl_on_data_nodes = false;
 TSDLLEXPORT char *ts_guc_ssl_dir = NULL;
 TSDLLEXPORT char *ts_guc_passfile = NULL;
 TSDLLEXPORT bool ts_guc_enable_remote_explain = false;
-TSDLLEXPORT DataFetcherType ts_guc_remote_data_fetcher = RowByRowFetcherType;
+TSDLLEXPORT DataFetcherType ts_guc_remote_data_fetcher = AutoFetcherType;
 
 #ifdef TS_DEBUG
 bool ts_shutdown_bgw = false;
@@ -310,7 +317,7 @@ _guc_init(void)
 							 "Pick data fetcher type based on type of queries you plan to run "
 							 "(rowbyrow or cursor)",
 							 (int *) &ts_guc_remote_data_fetcher,
-							 CursorFetcherType,
+							 AutoFetcherType,
 							 remote_data_fetchers,
 							 PGC_USERSET,
 							 0,
@@ -325,7 +332,7 @@ _guc_init(void)
 							   &ts_guc_ssl_dir,
 							   NULL,
 							   PGC_SIGHUP,
-							   GUC_SUPERUSER_ONLY,
+							   0,
 							   NULL,
 							   NULL,
 							   NULL);
@@ -337,7 +344,7 @@ _guc_init(void)
 							   &ts_guc_passfile,
 							   NULL,
 							   PGC_SIGHUP,
-							   GUC_SUPERUSER_ONLY,
+							   0,
 							   NULL,
 							   NULL,
 							   NULL);
@@ -374,6 +381,7 @@ _guc_init(void)
 							NULL,
 							assign_max_cached_chunks_per_hypertable_hook,
 							NULL);
+#ifdef USE_TELEMETRY
 	DefineCustomEnumVariable("timescaledb.telemetry_level",
 							 "Telemetry settings level",
 							 "Level used to determine which telemetry to send",
@@ -385,6 +393,7 @@ _guc_init(void)
 							 NULL,
 							 NULL,
 							 NULL);
+#endif
 
 	DefineCustomStringVariable(/* name= */ "timescaledb.license",
 							   /* short_dec= */ "TimescaleDB license type",
@@ -419,6 +428,7 @@ _guc_init(void)
 							   /* assign_hook= */ NULL,
 							   /* show_hook= */ NULL);
 
+#ifdef USE_TELEMETRY
 	DefineCustomStringVariable(/* name= */ "timescaledb_telemetry.cloud",
 							   /* short_dec= */ "cloud provider",
 							   /* long_dec= */ "cloud provider used for this instance",
@@ -429,6 +439,7 @@ _guc_init(void)
 							   /* check_hook= */ NULL,
 							   /* assign_hook= */ NULL,
 							   /* show_hook= */ NULL);
+#endif
 
 #ifdef TS_DEBUG
 	DefineCustomBoolVariable(/* name= */ "timescaledb.shutdown_bgw_scheduler",

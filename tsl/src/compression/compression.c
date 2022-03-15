@@ -32,21 +32,21 @@
 #include <utils/tuplesort.h>
 #include <utils/typcache.h>
 
-#include <catalog.h>
 #include <utils.h>
 
-#include "compat.h"
+#include "compat/compat.h"
 
 #include "array.h"
 #include "chunk.h"
 #include "deltadelta.h"
 #include "dictionary.h"
 #include "gorilla.h"
-#include "compression_chunk_size.h"
+#include "ts_catalog/compression_chunk_size.h"
 #include "create.h"
 #include "custom_type_cache.h"
-#include "hypertable_compression.h"
 #include "segment_meta.h"
+#include "ts_catalog/hypertable_compression.h"
+#include "ts_catalog/catalog.h"
 
 #include <nodes/print.h>
 
@@ -244,7 +244,13 @@ truncate_relation(Oid table_oid)
 		table_close(rel, NoLock);
 	}
 
-	reindex_relation(table_oid, REINDEX_REL_PROCESS_TOAST, 0);
+#if PG14_LT
+	int options = 0;
+#else
+	ReindexParams params = { 0 };
+	ReindexParams *options = &params;
+#endif
+	reindex_relation(table_oid, REINDEX_REL_PROCESS_TOAST, options);
 	rel = table_open(table_oid, AccessExclusiveLock);
 	restore_pgclass_stats(table_oid, pages, visible, tuples);
 	CommandCounterIncrement();
@@ -306,7 +312,13 @@ compress_chunk(Oid in_table, Oid out_table, const ColumnCompressionInfo **column
 
 	/* Recreate all indexes on out rel, we already have an exclusive lock on it,
 	 * so the strong locks taken by reindex_relation shouldn't matter. */
-	reindex_relation(out_table, 0, 0);
+#if PG14_LT
+	int options = 0;
+#else
+	ReindexParams params = { 0 };
+	ReindexParams *options = &params;
+#endif
+	reindex_relation(out_table, 0, options);
 
 	table_close(out_rel, NoLock);
 	table_close(in_rel, NoLock);
@@ -829,6 +841,8 @@ row_compressor_flush(RowCompressor *row_compressor, CommandId mycid, bool change
 				0 /*=options*/,
 				row_compressor->bistate);
 
+	heap_freetuple(compressed_tuple);
+
 	/* free the compressed values now that we're done with them (the old compressor is freed in
 	 * finish()) */
 	for (col = 0; col < row_compressor->n_input_columns; col++)
@@ -1094,7 +1108,13 @@ decompress_chunk(Oid in_table, Oid out_table)
 
 	/* Recreate all indexes on out rel, we already have an exclusive lock on it,
 	 * so the strong locks taken by reindex_relation shouldn't matter. */
-	reindex_relation(out_table, 0, 0);
+#if PG14_LT
+	int options = 0;
+#else
+	ReindexParams params = { 0 };
+	ReindexParams *options = &params;
+#endif
+	reindex_relation(out_table, 0, options);
 
 	table_close(out_rel, NoLock);
 	table_close(in_rel, NoLock);

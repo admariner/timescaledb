@@ -18,13 +18,13 @@
 #include <utils/memutils.h>
 #include <utils/typcache.h>
 
-#include "compat.h"
+#include "compat/compat.h"
 #include "compression/array.h"
 #include "compression/compression.h"
 #include "nodes/decompress_chunk/decompress_chunk.h"
 #include "nodes/decompress_chunk/exec.h"
 #include "nodes/decompress_chunk/planner.h"
-#include "hypertable_compression.h"
+#include "ts_catalog/hypertable_compression.h"
 
 typedef enum DecompressChunkColumnType
 {
@@ -324,8 +324,6 @@ decompress_chunk_exec(CustomScanState *node)
 	if (node->custom_ps == NIL)
 		return NULL;
 
-	ResetExprContext(econtext);
-
 	while (true)
 	{
 		TupleTableSlot *slot = decompress_chunk_create_tuple(state);
@@ -334,6 +332,10 @@ decompress_chunk_exec(CustomScanState *node)
 			return NULL;
 
 		econtext->ecxt_scantuple = slot;
+
+		/* Reset expression memory context to clean out any cruft from
+		 * previous tuple. */
+		ResetExprContext(econtext);
 
 		if (node->ss.ps.qual && !ExecQual(node->ss.ps.qual, econtext))
 		{
@@ -408,7 +410,13 @@ decompress_chunk_create_tuple(DecompressChunkState *state)
 				{
 					AttrNumber attr = AttrNumberGetAttrOffset(column->attno);
 
-					if (column->compressed.iterator != NULL)
+					if (!column->compressed.iterator)
+					{
+						slot->tts_values[attr] = getmissingattr(slot->tts_tupleDescriptor,
+																attr + 1,
+																&slot->tts_isnull[attr]);
+					}
+					else
 					{
 						DecompressResult result;
 						result = column->compressed.iterator->try_next(column->compressed.iterator);
@@ -431,8 +439,6 @@ decompress_chunk_create_tuple(DecompressChunkState *state)
 						slot->tts_values[attr] = result.val;
 						slot->tts_isnull[attr] = result.is_null;
 					}
-					else
-						slot->tts_isnull[attr] = true;
 
 					break;
 				}

@@ -100,7 +100,15 @@ BEGIN
       GROUP BY bucket, location
       HAVING min(location) >= 'NYC' and avg(temperature) > 2;
 
+    -- ALTER VIEW cannot rename columns before PG13, but ALTER TABLE
+    -- works for views.
+    ALTER TABLE rename_cols RENAME COLUMN bucket to "time";
   ELSE
+    -- rename_cols cagg view is also used for another test: if we can enable
+    -- compression on a cagg after an upgrade
+    -- This view has 3 cols which is fewer than the number of cols on the table
+    -- we had a bug related to that and need to verify if compression can be
+    -- enabled on such a view
     CREATE MATERIALIZED VIEW rename_cols
     WITH (timescaledb.continuous, timescaledb.materialized_only = false) AS
     SELECT time_bucket('1 week', timec) AS bucket, location, avg(humidity)
@@ -153,10 +161,10 @@ BEGIN
       GROUP BY bucket, location
       HAVING min(location) >= 'NYC' and avg(temperature) > 2 WITH NO DATA;
     PERFORM add_continuous_aggregate_policy('mat_before', NULL, '-30 days'::interval, '336 h');
+
+    ALTER MATERIALIZED VIEW rename_cols RENAME COLUMN bucket to "time";
   END IF;
 END $$;
-
-ALTER MATERIALIZED VIEW rename_cols RENAME COLUMN bucket to "time";
 
 \if :WITH_SUPERUSER
 GRANT SELECT ON mat_before TO cagg_user WITH GRANT OPTION;
@@ -374,7 +382,7 @@ SELECT generate_series('2118-12-01 00:00'::timestamp, '2118-12-20 00:00'::timest
 CREATE TABLE int_time_test(timeval integer not null, col1 integer, col2 integer);
 select create_hypertable('int_time_test', 'timeval', chunk_time_interval=> 2);
 
-CREATE OR REPLACE FUNCTION integer_now_test() returns int LANGUAGE SQL STABLE as $$ SELECT coalesce(max(timeval), 0) FROM int_time_test $$;
+CREATE OR REPLACE FUNCTION integer_now_test() returns int LANGUAGE SQL STABLE as $$ SELECT coalesce(max(timeval), 0) FROM public.int_time_test $$;
 SELECT set_integer_now_func('int_time_test', 'integer_now_test');
 
 INSERT INTO int_time_test VALUES

@@ -11,7 +11,7 @@
 #include <postmaster/bgworker.h>
 
 #include "export.h"
-#include "catalog.h"
+#include "ts_catalog/catalog.h"
 
 typedef struct BgwJob
 {
@@ -40,6 +40,7 @@ extern bool ts_bgw_job_has_timeout(BgwJob *job);
 extern TimestampTz ts_bgw_job_timeout_at(BgwJob *job, TimestampTz start_time);
 
 extern TSDLLEXPORT bool ts_bgw_job_delete_by_id(int32 job_id);
+extern TSDLLEXPORT bool ts_bgw_job_update_by_id(int32 job_id, BgwJob *job);
 extern TSDLLEXPORT int32 ts_bgw_job_insert_relation(Name application_name,
 													Interval *schedule_interval,
 													Interval *max_runtime, int32 max_retries,

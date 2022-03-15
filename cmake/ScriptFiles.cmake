@@ -15,21 +15,18 @@ set(PRE_INSTALL_SOURCE_FILES
     pre_install/types.functions.sql
     pre_install/types.post.sql # Must be before tables.sql
     pre_install/tables.sql
+    pre_install/cache.sql
     pre_install/insert_data.sql
-    pre_install/bgw_scheduler_startup.sql
     pre_install/fdw_functions.sql
     pre_install/timescaledb_fdw.sql)
 
-# Things like aggregate functions cannot be REPLACEd and really need to be
-# created just once(like PRE_INSTALL_SOURCE_FILES) but unlike
-# PRE_INSTALL_SOURCE_FILES these have to be loaded after everything else is
-# loaded.
-set(IMMUTABLE_API_SOURCE_FILES aggregates.sql)
+# Source files that define functions and need to be rerun in update
+set(PRE_INSTALL_FUNCTION_FILES
+    pre_install/types.functions.sql
+    pre_install/fdw_functions.sql)
 
 # The rest of the source files defining mostly functions
 set(SOURCE_FILES
-    pre_install/types.functions.sql
-    pre_install/fdw_functions.sql
     hypertable.sql
     chunk.sql
     data_node.sql
@@ -49,7 +46,6 @@ set(SOURCE_FILES
     version.sql
     size_utils.sql
     histogram.sql
-    cache.sql
     bgw_scheduler.sql
     metadata.sql
     dist_internal.sql
@@ -61,7 +57,18 @@ set(SOURCE_FILES
     restoring.sql
     job_api.sql
     policy_api.sql
-    policy_internal.sql)
+    policy_internal.sql
+    cagg_utils.sql)
+
+if(USE_TELEMETRY)
+  list(APPEND SOURCE_FILES with_telemetry.sql)
+else()
+  list(APPEND SOURCE_FILES without_telemetry.sql)
+endif()
+
+# These files need to be last in the scripts.
+list(APPEND SOURCE_FILES 
+  bgw_startup.sql)
 
 # These files should be pre-pended to update scripts so that they are executed
 # before anything else during updates

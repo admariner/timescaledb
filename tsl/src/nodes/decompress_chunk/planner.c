@@ -37,16 +37,7 @@ static CustomScanMethods decompress_chunk_plan_methods = {
 void
 _decompress_chunk_init(void)
 {
-	/*
-	 * Because we reinitialize the tsl stuff when the license
-	 * changes the init function may be called multiple times
-	 * per session so we check if DecompressChunk node has been
-	 * registered already here to prevent registering it twice.
-	 */
-	if (GetCustomScanMethods(decompress_chunk_plan_methods.CustomName, true) == NULL)
-	{
-		RegisterCustomScanMethods(&decompress_chunk_plan_methods);
-	}
+	TryRegisterCustomScanMethods(&decompress_chunk_plan_methods);
 }
 
 static TargetEntry *
@@ -68,6 +59,26 @@ make_compressed_scan_meta_targetentry(DecompressChunkPath *path, char *column_na
 	path->varattno_map = lappend_int(path->varattno_map, id);
 
 	return makeTargetEntry((Expr *) scan_var, tle_index, NULL, false);
+}
+
+/*
+ * Find matching column attno for compressed chunk based on hypertable attno.
+ *
+ * Since we dont want aliasing to interfere we lookup directly in catalog
+ * instead of using RangeTblEntry.
+ */
+static AttrNumber
+get_compressed_attno(CompressionInfo *info, AttrNumber ht_attno)
+{
+	AttrNumber compressed_attno;
+	Assert(info->ht_rte);
+	char *chunk_col = get_attname(info->ht_rte->relid, ht_attno, false);
+	compressed_attno = get_attnum(info->compressed_rte->relid, chunk_col);
+
+	if (compressed_attno == InvalidAttrNumber)
+		elog(ERROR, "no matching column in compressed chunk found");
+
+	return compressed_attno;
 }
 
 static TargetEntry *
@@ -159,13 +170,13 @@ build_scan_tlist(DecompressChunkPath *path)
 
 		foreach (lc, path->info->ht_rte->eref->colnames)
 		{
-			Value *chunk_col = (Value *) lfirst(lc);
+			const char *chunk_col = strVal(lfirst(lc));
 			ht_attno++;
 
 			/*
 			 * dropped columns have empty string
 			 */
-			if (IsA(lfirst(lc), String) && strlen(chunk_col->val.str) > 0)
+			if (IsA(lfirst(lc), String) && strlen(chunk_col) > 0)
 			{
 				tle = make_compressed_scan_targetentry(path, ht_attno, list_length(scan_tlist) + 1);
 				scan_tlist = lappend(scan_tlist, tle);

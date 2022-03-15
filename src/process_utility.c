@@ -20,6 +20,7 @@
 #include <commands/cluster.h>
 #include <commands/event_trigger.h>
 #include <access/htup_details.h>
+#include <commands/alter.h>
 #include <access/xact.h>
 #include <storage/lmgr.h>
 #include <utils/acl.h>
@@ -35,18 +36,18 @@
 
 #include <catalog/pg_constraint.h>
 #include <catalog/pg_inherits.h>
-#include "compat.h"
+#include "compat/compat.h"
 
 #include <miscadmin.h>
 
 #include "annotations.h"
 #include "export.h"
 #include "process_utility.h"
-#include "catalog.h"
+#include "ts_catalog/catalog.h"
 #include "chunk.h"
 #include "chunk_index.h"
-#include "chunk_data_node.h"
-#include "compat.h"
+#include "ts_catalog/chunk_data_node.h"
+#include "compat/compat.h"
 #include "copy.h"
 #include "errors.h"
 #include "event_trigger.h"
@@ -54,7 +55,7 @@
 #include "hypercube.h"
 #include "hypertable.h"
 #include "hypertable_cache.h"
-#include "hypertable_data_node.h"
+#include "ts_catalog/hypertable_data_node.h"
 #include "dimension_vector.h"
 #include "indexing.h"
 #include "scan_iterator.h"
@@ -63,7 +64,7 @@
 #include "utils.h"
 #include "with_clause_parser.h"
 #include "cross_module_fn.h"
-#include "continuous_agg.h"
+#include "ts_catalog/continuous_agg.h"
 #include "compression_with_clause.h"
 #include "partitioning.h"
 #include "debug_point.h"
@@ -83,28 +84,19 @@ static DDLResult process_altertable_reset_options(AlterTableCmd *cmd, Hypertable
 static void
 prev_ProcessUtility(ProcessUtilityArgs *args)
 {
-	if (prev_ProcessUtility_hook != NULL)
-	{
-		/* Call any earlier hooks */
-		(prev_ProcessUtility_hook)(args->pstmt,
-								   args->query_string,
-								   args->context,
-								   args->params,
-								   args->queryEnv,
-								   args->dest,
-								   args->completion_tag);
-	}
-	else
-	{
-		/* Call the standard */
-		standard_ProcessUtility(args->pstmt,
-								args->query_string,
-								args->context,
-								args->params,
-								args->queryEnv,
-								args->dest,
-								args->completion_tag);
-	}
+	ProcessUtility_hook_type hook =
+		prev_ProcessUtility_hook ? prev_ProcessUtility_hook : standard_ProcessUtility;
+
+	hook(args->pstmt,
+		 args->query_string,
+#if PG14_GE
+		 args->readonly_tree,
+#endif
+		 args->context,
+		 args->params,
+		 args->queryEnv,
+		 args->dest,
+		 args->completion_tag);
 }
 
 static ObjectType
@@ -157,6 +149,10 @@ check_chunk_alter_table_operation_allowed(Oid relid, AlterTableStmt *stmt)
 				case AT_EnableRowSecurity:
 				case AT_DisableRowSecurity:
 				case AT_SetTableSpace:
+#if PG14_GE
+				case AT_ReAddStatistics:
+				case AT_SetCompression:
+#endif
 					/* allowed on chunks */
 					break;
 				default:
@@ -173,7 +169,8 @@ check_chunk_alter_table_operation_allowed(Oid relid, AlterTableStmt *stmt)
 	}
 }
 
-/* on continuous aggregate materialization tables we block all altercommands except for ADD INDEX */
+/* we block some ALTER commands on continuous aggregate materialization tables
+ */
 static void
 check_continuous_agg_alter_table_allowed(Hypertable *ht, AlterTableStmt *stmt)
 {
@@ -191,6 +188,7 @@ check_continuous_agg_alter_table_allowed(Hypertable *ht, AlterTableStmt *stmt)
 		{
 			case AT_AddIndex:
 			case AT_ReAddIndex:
+			case AT_SetRelOptions:
 				/* allowed on materialization tables */
 				continue;
 			default:
@@ -235,6 +233,12 @@ check_alter_table_allowed_on_ht_with_compression(Hypertable *ht, AlterTableStmt 
 				/* this is passed down in `process_altertable_set_tablespace_end` */
 			case AT_SetStatistics: /* should this be pushed down in some way? */
 			case AT_AddColumn:	 /* this is passed down */
+			case AT_ColumnDefault: /* this is passed down */
+			case AT_DropColumn:	/* this is passed down */
+#if PG14_GE
+			case AT_ReAddStatistics:
+			case AT_SetCompression:
+#endif
 				continue;
 				/*
 				 * BLOCKED:
@@ -259,11 +263,53 @@ check_alter_table_allowed_on_ht_with_compression(Hypertable *ht, AlterTableStmt 
 static void
 check_altertable_add_column_for_compressed(Hypertable *ht, ColumnDef *col)
 {
-	if (col->constraints || col->is_not_null == true || col->identitySequence != NULL)
+	if (col->constraints)
+	{
+		bool has_default = false;
+		bool has_notnull = col->is_not_null;
+		ListCell *lc;
+		foreach (lc, col->constraints)
+		{
+			Constraint *constraint = lfirst_node(Constraint, lc);
+			switch (constraint->contype)
+			{
+				case CONSTR_NOTNULL:
+					has_notnull = true;
+					continue;
+				case CONSTR_DEFAULT:
+					/* since default expressions might trigger a table rewrite we
+					 * only allow Const here for now */
+					if (!IsA(constraint->raw_expr, A_Const))
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("cannot add column with non-constant default expression "
+										"to a hypertable that has compression enabled")));
+
+					has_default = true;
+					continue;
+
+				default:
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("cannot add column with constraints "
+									"to a hypertable that has compression enabled")));
+					break;
+			}
+		}
+		/* require a default for columns added with NOT NULL */
+		if (has_notnull && !has_default)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot add column with NOT NULL contraint without default "
+							"to a hypertable that has compression enabled")));
+		}
+	}
+	if (col->is_not_null || col->identitySequence != NULL)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot add column with constraints or defaults to a hypertable that has "
+				 errmsg("cannot add column with constraints to a hypertable that has "
 						"compression enabled")));
 	}
 	/* not possible to get non-null value here this is set when
@@ -288,14 +334,39 @@ add_hypertable_to_process_args(ProcessUtilityArgs *args, const Hypertable *ht)
 	args->hypertable_list = lappend_oid(args->hypertable_list, ht->main_table_relid);
 }
 
+static bool
+check_table_in_rangevar_list(List *rvlist, Name schema_name, Name table_name)
+{
+	ListCell *l;
+
+	foreach (l, rvlist)
+	{
+		RangeVar *rvar = lfirst_node(RangeVar, l);
+
+		if (strcmp(rvar->relname, NameStr(*table_name)) == 0 &&
+			strcmp(rvar->schemaname, NameStr(*schema_name)) == 0)
+			return true;
+	}
+
+	return false;
+}
+
 static void
 add_chunk_oid(Hypertable *ht, Oid chunk_relid, void *vargs)
 {
 	ProcessUtilityArgs *args = vargs;
 	GrantStmt *stmt = castNode(GrantStmt, args->parsetree);
 	Chunk *chunk = ts_chunk_get_by_relid(chunk_relid, true);
-	RangeVar *rv = makeRangeVar(NameStr(chunk->fd.schema_name), NameStr(chunk->fd.table_name), -1);
-	stmt->objects = lappend(stmt->objects, rv);
+	/*
+	 * If chunk is in the same schema as the hypertable it could already be part of
+	 * the objects list in the case of "GRANT ALL IN SCHEMA" for example
+	 */
+	if (!check_table_in_rangevar_list(stmt->objects, &chunk->fd.schema_name, &chunk->fd.table_name))
+	{
+		RangeVar *rv =
+			makeRangeVar(NameStr(chunk->fd.schema_name), NameStr(chunk->fd.table_name), -1);
+		stmt->objects = lappend(stmt->objects, rv);
+	}
 }
 
 static bool
@@ -336,8 +407,7 @@ process_drop_foreign_server_start(DropStmt *stmt)
 
 	foreach (lc, stmt->objects)
 	{
-		Value *value = lfirst(lc);
-		const char *servername = strVal(value);
+		const char *servername = strVal(lfirst(lc));
 
 		if (block_on_foreign_server(servername))
 			ereport(ERROR,
@@ -404,26 +474,13 @@ process_alter_foreign_server(ProcessUtilityArgs *args)
 {
 	AlterForeignServerStmt *stmt = (AlterForeignServerStmt *) args->parsetree;
 
-	if (block_on_foreign_server(stmt->servername))
+	if (stmt->has_version)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("alter server not supported on a TimescaleDB data node")));
+				 errmsg("operation not supported"),
+				 errdetail("It is not possible to set a version on the data node configuration.")));
 
-	return DDL_CONTINUE;
-}
-
-static DDLResult
-process_alter_owner(ProcessUtilityArgs *args)
-{
-	AlterOwnerStmt *stmt = (AlterOwnerStmt *) args->parsetree;
-
-	if ((stmt->objectType == OBJECT_FOREIGN_SERVER) &&
-		block_on_foreign_server(strVal(stmt->object)))
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("alter owner not supported on a TimescaleDB data node")));
-	}
+	/* Other options are validated by the FDW */
 
 	return DDL_CONTINUE;
 }
@@ -921,6 +978,8 @@ process_truncate(ProcessUtilityArgs *args)
 	ListCell *cell;
 	List *hypertables = NIL;
 	List *relations = NIL;
+	bool list_changed = false;
+	MemoryContext parsetreectx = GetMemoryChunkContext(args->parsetree);
 
 	/* For all hypertables, we drop the now empty chunks. We also propagate the
 	 * TRUNCATE call to the compressed version of the hypertable, if it exists.
@@ -930,8 +989,9 @@ process_truncate(ProcessUtilityArgs *args)
 	{
 		RangeVar *rv = lfirst(cell);
 		Oid relid;
+		bool list_append = false;
 
-		if (NULL == rv)
+		if (!rv)
 			continue;
 
 		/* Grab AccessExclusiveLock, same as regular TRUNCATE processing grabs
@@ -939,87 +999,120 @@ process_truncate(ProcessUtilityArgs *args)
 		relid = RangeVarGetRelid(rv, AccessExclusiveLock, true);
 
 		if (!OidIsValid(relid))
-			continue;
-
-		switch (get_rel_relkind(relid))
 		{
-			case RELKIND_VIEW:
+			/* We should add invalid relations to the list to raise error on the
+			 * standard_ProcessUtility when we're trying to TRUNCATE a nonexistent relation */
+			list_append = true;
+		}
+		else
+		{
+			switch (get_rel_relkind(relid))
 			{
-				ContinuousAgg *cagg = ts_continuous_agg_find_by_relid(relid);
-
-				if (NULL != cagg)
+				case RELKIND_VIEW:
 				{
-					Hypertable *ht;
+					ContinuousAgg *cagg = ts_continuous_agg_find_by_relid(relid);
 
-					if (!relation_should_recurse(rv))
-						ereport(ERROR,
-								(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-								 errmsg("cannot truncate only a continuous aggregate")));
+					if (cagg)
+					{
+						Hypertable *mat_ht, *raw_ht;
+						MemoryContext oldctx;
 
-					ht = ts_hypertable_get_by_id(cagg->data.mat_hypertable_id);
-					Assert(ht != NULL);
-					rv = makeRangeVar(NameStr(ht->fd.schema_name), NameStr(ht->fd.table_name), -1);
+						if (!relation_should_recurse(rv))
+							ereport(ERROR,
+									(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+									 errmsg("cannot truncate only a continuous aggregate")));
 
-					/* Invalidate the entire continuous aggregate since it no
-					 * longer has any data */
-					ts_cm_functions->continuous_agg_invalidate(ht, PG_INT64_MIN, PG_INT64_MAX);
+						mat_ht = ts_hypertable_get_by_id(cagg->data.mat_hypertable_id);
+						Assert(mat_ht != NULL);
+
+						/* Create list item into the same context of the list */
+						oldctx = MemoryContextSwitchTo(parsetreectx);
+						rv = makeRangeVar(NameStr(mat_ht->fd.schema_name),
+										  NameStr(mat_ht->fd.table_name),
+										  -1);
+						MemoryContextSwitchTo(oldctx);
+
+						/* Invalidate the entire continuous aggregate since it no
+						 * longer has any data */
+						raw_ht = ts_hypertable_get_by_id(cagg->data.raw_hypertable_id);
+						Assert(raw_ht != NULL);
+						ts_cm_functions->continuous_agg_invalidate_mat_ht(raw_ht,
+																		  mat_ht,
+																		  TS_TIME_NOBEGIN,
+																		  TS_TIME_NOEND);
+
+						/* mark list as changed because we'll add the materialization hypertable */
+						list_changed = true;
+					}
+
+					list_append = true;
+					break;
 				}
-
-				relations = lappend(relations, rv);
-				break;
-			}
-			case RELKIND_RELATION:
-			{
-				Hypertable *ht =
-					ts_hypertable_cache_get_entry(hcache, relid, CACHE_FLAG_MISSING_OK);
-
-				if (ht == NULL)
-					relations = lappend(relations, rv);
-				else
+				case RELKIND_RELATION:
 				{
-					ContinuousAggHypertableStatus agg_status;
+					Hypertable *ht =
+						ts_hypertable_cache_get_entry(hcache, relid, CACHE_FLAG_MISSING_OK);
 
-					agg_status = ts_continuous_agg_hypertable_status(ht->fd.id);
+					if (!ht)
+						list_append = true;
+					else
+					{
+						ContinuousAggHypertableStatus agg_status;
 
-					ts_hypertable_permissions_check_by_id(ht->fd.id);
+						agg_status = ts_continuous_agg_hypertable_status(ht->fd.id);
 
-					if ((agg_status & HypertableIsMaterialization) != 0)
-						ereport(ERROR,
-								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-								 errmsg("cannot TRUNCATE a hypertable underlying a continuous "
-										"aggregate"),
-								 errhint("TRUNCATE the continuous aggregate instead.")));
+						ts_hypertable_permissions_check_by_id(ht->fd.id);
 
-					if (agg_status == HypertableIsRawTable)
-						/* The truncation invalidates all associated continuous aggregates */
-						ts_cm_functions->continuous_agg_invalidate(ht,
-																   TS_TIME_NOBEGIN,
-																   TS_TIME_NOEND);
+						if ((agg_status & HypertableIsMaterialization) != 0)
+							ereport(ERROR,
+									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									 errmsg("cannot TRUNCATE a hypertable underlying a continuous "
+											"aggregate"),
+									 errhint("TRUNCATE the continuous aggregate instead.")));
 
-					if (!relation_should_recurse(rv))
-						ereport(ERROR,
-								(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-								 errmsg("cannot truncate only a hypertable"),
-								 errhint("Do not specify the ONLY keyword, or use truncate"
-										 " only on the chunks directly.")));
+						if (agg_status == HypertableIsRawTable)
+						{
+							/* The truncation invalidates all associated continuous aggregates */
+							ts_cm_functions->continuous_agg_invalidate_raw_ht(ht,
+																			  TS_TIME_NOBEGIN,
+																			  TS_TIME_NOEND);
+						}
 
-					hypertables = lappend(hypertables, ht);
+						if (!relation_should_recurse(rv))
+							ereport(ERROR,
+									(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+									 errmsg("cannot truncate only a hypertable"),
+									 errhint("Do not specify the ONLY keyword, or use truncate"
+											 " only on the chunks directly.")));
 
-					if (!hypertable_is_distributed(ht))
-						relations = lappend(relations, rv);
+						hypertables = lappend(hypertables, ht);
+
+						if (!hypertable_is_distributed(ht))
+							list_append = true;
+						else
+							/* mark list as changed because we'll not add the distributed hypertable
+							 */
+							list_changed = true;
+					}
+					break;
 				}
-				break;
 			}
-			default:
-				relations = lappend(relations, rv);
-				break;
+		}
+
+		/* Append the relation to the list in the same parse tree memory context */
+		if (list_append)
+		{
+			MemoryContext oldctx = MemoryContextSwitchTo(parsetreectx);
+			relations = lappend(relations, rv);
+			MemoryContextSwitchTo(oldctx);
 		}
 	}
 
-	/* Update relations list to include only tables that hold data. On an
-	 * access node, distributed hypertables hold no data and chunks are
-	 * foreign tables, so those tables are excluded. */
-	stmt->relations = relations;
+	/* Update relations list just when changed to include only tables
+	 * that hold data. On an access node, distributed hypertables hold
+	 * no data and chunks are foreign tables, so those tables are excluded. */
+	if (list_changed)
+		stmt->relations = relations;
 
 	if (stmt->relations != NIL)
 	{
@@ -1127,7 +1220,7 @@ process_drop_chunk(ProcessUtilityArgs *args, DropStmt *stmt)
 
 				Assert(hyperspace_get_open_dimension(ht->space, 0)->fd.id ==
 					   chunk->cube->slices[0]->fd.dimension_id);
-				ts_cm_functions->continuous_agg_invalidate(ht, start, end);
+				ts_cm_functions->continuous_agg_invalidate_raw_ht(ht, start, end);
 			}
 		}
 	}
@@ -1269,10 +1362,103 @@ process_grant_add_by_rel(GrantStmt *stmt, RangeVar *relation)
 	stmt->objects = lappend(stmt->objects, relation);
 }
 
+/*
+ * If it is a "GRANT/REVOKE ON ALL TABLES IN SCHEMA" operation then we need to check if
+ * the rangevar was already added when we added all objects inside the SCHEMA
+ *
+ * This could get a little expensive for schemas containing a lot of objects..
+ */
 static void
-process_grant_add_by_name(GrantStmt *stmt, Name schema_name, Name table_name)
+process_grant_add_by_name(GrantStmt *stmt, bool was_schema_op, Name schema_name, Name table_name)
 {
-	process_grant_add_by_rel(stmt, makeRangeVar(NameStr(*schema_name), NameStr(*table_name), -1));
+	bool already_added = false;
+
+	if (was_schema_op)
+		already_added = check_table_in_rangevar_list(stmt->objects, schema_name, table_name);
+
+	if (!already_added)
+		process_grant_add_by_rel(stmt,
+								 makeRangeVar(NameStr(*schema_name), NameStr(*table_name), -1));
+}
+
+static void
+process_relations_in_namespace(GrantStmt *stmt, Name schema_name, Oid namespaceId, char relkind)
+{
+	ScanKeyData key[2];
+	Relation rel;
+	TableScanDesc scan;
+	HeapTuple tuple;
+
+	ScanKeyInit(&key[0],
+				Anum_pg_class_relnamespace,
+				BTEqualStrategyNumber,
+				F_OIDEQ,
+				ObjectIdGetDatum(namespaceId));
+	ScanKeyInit(&key[1],
+				Anum_pg_class_relkind,
+				BTEqualStrategyNumber,
+				F_CHAREQ,
+				CharGetDatum(relkind));
+
+	rel = table_open(RelationRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(rel, 2, key);
+
+	while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Name relname = &((Form_pg_class) GETSTRUCT(tuple))->relname;
+
+		/* these are being added for the first time into this list */
+		process_grant_add_by_name(stmt, false, schema_name, relname);
+	}
+
+	table_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return;
+}
+
+/*
+ * For "GRANT ALL ON ALL TABLES IN SCHEMA" GrantStmt, the targtype field is ACL_TARGET_ALL_IN_SCHEMA
+ * whereas in regular "GRANT ON TABLE table_name", the targtype field is ACL_TARGET_OBJECT. In the
+ * latter case the objects list contains a list of relation range vars whereas in the former it is
+ * the list of schema names.
+ *
+ * To make things work we change the targtype field from ACL_TARGET_ALL_IN_SCHEMA to
+ * ACL_TARGET_OBJECT and then create a new list of rangevars of all relation type entities in it and
+ * assign it to the "stmt->objects" field.
+ *
+ */
+static void
+process_grant_add_by_schema(GrantStmt *stmt)
+{
+	ListCell *cell;
+	List *nspnames = stmt->objects;
+
+	/*
+	 * We will be adding rangevars to the "stmt->objects" field in the loop below. So
+	 * we track the nspnames separately above and NIL out the objects list
+	 */
+	stmt->objects = NIL;
+	foreach (cell, nspnames)
+	{
+		char *nspname = strVal(lfirst(cell));
+		Oid namespaceId = LookupExplicitNamespace(nspname, false);
+		Name schema;
+
+		schema = (Name) palloc(NAMEDATALEN);
+
+		namestrcpy(schema, nspname);
+
+		/* Inspired from objectsInSchemaToOids PG function */
+		process_relations_in_namespace(stmt, schema, namespaceId, RELKIND_RELATION);
+		process_relations_in_namespace(stmt, schema, namespaceId, RELKIND_VIEW);
+		process_relations_in_namespace(stmt, schema, namespaceId, RELKIND_MATVIEW);
+		process_relations_in_namespace(stmt, schema, namespaceId, RELKIND_FOREIGN_TABLE);
+		process_relations_in_namespace(stmt, schema, namespaceId, RELKIND_PARTITIONED_TABLE);
+	}
+
+	/* change targtype to ACL_TARGET_OBJECT now */
+	stmt->targtype = ACL_TARGET_OBJECT;
 }
 
 /*
@@ -1287,8 +1473,8 @@ process_grant_and_revoke(ProcessUtilityArgs *args)
 	DDLResult result = DDL_CONTINUE;
 
 	/* We let the calling function handle anything that is not
-	 * ACL_TARGET_OBJECT (currently only ACL_TARGET_ALL_IN_SCHEMA) */
-	if (stmt->targtype != ACL_TARGET_OBJECT)
+	 * ACL_TARGET_OBJECT or ACL_TARGET_ALL_IN_SCHEMA */
+	if (stmt->targtype != ACL_TARGET_OBJECT && stmt->targtype != ACL_TARGET_ALL_IN_SCHEMA)
 		return DDL_CONTINUE;
 
 	switch (stmt->objtype)
@@ -1309,9 +1495,24 @@ process_grant_and_revoke(ProcessUtilityArgs *args)
 			 * consider those when sending grants to other data nodes.
 			 */
 			{
-				Cache *hcache = ts_hypertable_cache_pin();
+				Cache *hcache;
 				ListCell *cell;
+				List *saved_schema_objects = NIL;
+				bool was_schema_op = false;
 
+				/*
+				 * If it's a GRANT/REVOKE ALL IN SCHEMA then we need to collect all
+				 * objects in this schema and convert this into an ACL_TARGET_OBJECT
+				 * entry with its objects field pointing to rangevars
+				 */
+				if (stmt->targtype == ACL_TARGET_ALL_IN_SCHEMA)
+				{
+					saved_schema_objects = stmt->objects;
+					process_grant_add_by_schema(stmt);
+					was_schema_op = true;
+				}
+
+				hcache = ts_hypertable_cache_pin();
 				/* First process all continuous aggregates in the list and add
 				 * the associated hypertables and views to the list of objects
 				 * to process */
@@ -1324,12 +1525,15 @@ process_grant_and_revoke(ProcessUtilityArgs *args)
 						Hypertable *mat_hypertable =
 							ts_hypertable_get_by_id(cagg->data.mat_hypertable_id);
 						process_grant_add_by_name(stmt,
+												  was_schema_op,
 												  &mat_hypertable->fd.schema_name,
 												  &mat_hypertable->fd.table_name);
 						process_grant_add_by_name(stmt,
+												  was_schema_op,
 												  &cagg->data.direct_view_schema,
 												  &cagg->data.direct_view_name);
 						process_grant_add_by_name(stmt,
+												  was_schema_op,
 												  &cagg->data.partial_view_schema,
 												  &cagg->data.partial_view_name);
 					}
@@ -1346,6 +1550,7 @@ process_grant_and_revoke(ProcessUtilityArgs *args)
 							ts_hypertable_get_by_id(hypertable->fd.compressed_hypertable_id);
 						Assert(compressed_hypertable);
 						process_grant_add_by_name(stmt,
+												  was_schema_op,
 												  &compressed_hypertable->fd.schema_name,
 												  &compressed_hypertable->fd.table_name);
 					}
@@ -1365,6 +1570,19 @@ process_grant_and_revoke(ProcessUtilityArgs *args)
 				}
 
 				ts_cache_release(hcache);
+
+				/* Execute command right away, to check any permission errors before propagating
+				 * it to the distributed DDL */
+				result = DDL_DONE;
+				prev_ProcessUtility(args);
+
+				/* Restore ALL IN SCHEMA command type and it's objects */
+				if (was_schema_op)
+				{
+					stmt->targtype = ACL_TARGET_ALL_IN_SCHEMA;
+					stmt->objects = saved_schema_objects;
+				}
+
 				break;
 			}
 		default:
@@ -1452,6 +1670,10 @@ process_drop_start(ProcessUtilityArgs *args)
 	{
 		case OBJECT_TABLE:
 			process_drop_hypertable(args, stmt);
+			TS_FALLTHROUGH;
+		case OBJECT_FOREIGN_TABLE:
+			/* Chunks can be either normal tables, or foreign tables in the case of a distributed
+			 * hypertable */
 			process_drop_chunk(args, stmt);
 			break;
 		case OBJECT_INDEX:
@@ -1488,16 +1710,14 @@ reindex_chunk(Hypertable *ht, Oid chunk_relid, void *arg)
 		case REINDEX_OBJECT_TABLE:
 			stmt->relation->relname = NameStr(chunk->fd.table_name);
 			stmt->relation->schemaname = NameStr(chunk->fd.schema_name);
-			ReindexTable(stmt->relation,
-						 stmt->options
 #if PG14_LT
-						 ,
+			ReindexTable(stmt->relation,
+						 get_reindex_options(stmt),
 						 stmt->concurrent /* should test for deadlocks */
-#elif PG14_GE
-						 ,
-						 false /* isTopLevel */
-#endif
 			);
+#elif PG14_GE
+			ExecReindex(NULL, stmt, false);
+#endif
 			break;
 		case REINDEX_OBJECT_INDEX:
 			/* Not supported, a.t.m. See note in process_reindex(). */
@@ -1543,7 +1763,7 @@ process_reindex(ProcessUtilityArgs *args)
 #if PG14_LT
 				if (stmt->concurrent)
 #else
-				if (stmt->options & REINDEXOPT_CONCURRENTLY)
+				if (get_reindex_options(stmt) & REINDEXOPT_CONCURRENTLY)
 #endif
 					ereport(ERROR,
 							(errmsg("concurrent index creation on hypertables is not supported")));
@@ -1635,25 +1855,72 @@ process_rename_column(ProcessUtilityArgs *args, Cache *hcache, Oid relid, Rename
 							stmt->subname,
 							get_rel_name(relid)),
 					 errhint("Rename the hypertable column instead.")));
-		return;
+
+		/* This was not a hypertable and not a chunk, but it could be a
+		 * continuous aggregate.
+		 *
+		 * If this is a continuous aggregate, the rename should be done on the
+		 * materialized table. Since the partial view and the direct view are
+		 * not referencing the materialized table, we need to handle it here,
+		 * and in addition, the dimension table contains the column name, we
+		 * need to update the name there. */
+		ContinuousAgg *cagg = ts_continuous_agg_find_by_relid(relid);
+		if (cagg)
+		{
+			RenameStmt *direct_view_stmt = castNode(RenameStmt, copyObject(stmt));
+			direct_view_stmt->relation = makeRangeVar(NameStr(cagg->data.direct_view_schema),
+													  NameStr(cagg->data.direct_view_name),
+													  -1);
+			ExecRenameStmt(direct_view_stmt);
+
+			RenameStmt *partial_view_stmt = castNode(RenameStmt, copyObject(stmt));
+			partial_view_stmt->relation = makeRangeVar(NameStr(cagg->data.partial_view_schema),
+													   NameStr(cagg->data.partial_view_name),
+													   -1);
+			ExecRenameStmt(partial_view_stmt);
+
+			/* Fetch the main table and it's relid and use that for the
+			 * processing below. This is necessary to rebuild the view based
+			 * on the table with the renamed columns. */
+			ht = ts_hypertable_get_by_id(cagg->data.mat_hypertable_id);
+			relid = ht->main_table_relid;
+
+			RenameStmt *mat_hypertable_stmt = castNode(RenameStmt, copyObject(stmt));
+			mat_hypertable_stmt->relation =
+				makeRangeVar(NameStr(ht->fd.schema_name), NameStr(ht->fd.table_name), -1);
+			ExecRenameStmt(mat_hypertable_stmt);
+		}
+	}
+	else
+	{
+		/* Block renaming columns on the materialization table of a continuous
+		 * agg, but only if this was an explicit request for rename on a
+		 * materialization table. */
+		if ((ts_continuous_agg_hypertable_status(ht->fd.id) & HypertableIsMaterialization) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("renaming columns on materialization tables is not supported"),
+					 errdetail("Column \"%s\" in materialization table \"%s\".",
+							   stmt->subname,
+							   get_rel_name(relid)),
+					 errhint("Rename the column on the continuous aggregate instead.")));
 	}
 
-	/* block renaming columns on the materialization table of a continuous agg*/
-	if ((ts_continuous_agg_hypertable_status(ht->fd.id) & HypertableIsMaterialization) != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot rename column \"%s\" of materialization table \"%s\"",
-						stmt->subname,
-						get_rel_name(relid))));
+	/* If there were a hypertable or a continuous aggregate, we need to rename
+	 * the dimension that we used as well as rebuilding the view. Otherwise,
+	 * we don't do anything. */
+	if (ht)
+	{
+		add_hypertable_to_process_args(args, ht);
+		dim = ts_hyperspace_get_mutable_dimension_by_name(ht->space,
+														  DIMENSION_TYPE_ANY,
+														  stmt->subname);
 
-	add_hypertable_to_process_args(args, ht);
-
-	dim = ts_hyperspace_get_mutable_dimension_by_name(ht->space, DIMENSION_TYPE_ANY, stmt->subname);
-
-	if (dim)
-		ts_dimension_set_name(dim, stmt->newname);
-	if (ts_cm_functions->process_rename_cmd)
-		ts_cm_functions->process_rename_cmd(ht, stmt);
+		if (dim)
+			ts_dimension_set_name(dim, stmt->newname);
+		if (ts_cm_functions->process_rename_cmd)
+			ts_cm_functions->process_rename_cmd(relid, hcache, stmt);
+	}
 }
 
 static void
@@ -1699,7 +1966,7 @@ process_rename_schema(RenameStmt *stmt)
 	/* Block any renames of our internal schemas */
 	for (i = 0; i < NUM_TIMESCALEDB_SCHEMAS; i++)
 	{
-		if (strncmp(stmt->subname, timescaledb_schema_names[i], NAMEDATALEN) == 0)
+		if (strncmp(stmt->subname, ts_extension_schema_names[i], NAMEDATALEN) == 0)
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_TS_OPERATION_NOT_SUPPORTED),
@@ -1820,13 +2087,6 @@ process_rename(ProcessUtilityArgs *args)
 		 * stmt->relation never be NULL unless we are renaming a schema or
 		 * other objects, like foreign server
 		 */
-		if ((stmt->renameType == OBJECT_FOREIGN_SERVER) &&
-			block_on_foreign_server(strVal(stmt->object)))
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("rename not supported on a TimescaleDB data node")));
-		}
 		if (stmt->renameType != OBJECT_SCHEMA)
 			return DDL_CONTINUE;
 	}
@@ -2361,7 +2621,7 @@ process_index_start(ProcessUtilityArgs *args)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg(
-					 "cannot use timescaledb.transaction_per_chunk with distributed hypetable")));
+					 "cannot use timescaledb.transaction_per_chunk with distributed hypertable")));
 
 	ts_indexing_verify_index(ht->space, stmt);
 
@@ -2645,14 +2905,7 @@ process_cluster_start(ProcessUtilityArgs *args)
 			 * Since we keep OIDs between transactions, there is a potential
 			 * issue if an OID gets reassigned between two subtransactions
 			 */
-			cluster_rel(cim->chunkoid,
-						cim->indexoid,
-						stmt->options
-#if PG14_GE
-						,
-						args->context == PROCESS_UTILITY_TOPLEVEL
-#endif
-			);
+			cluster_rel(cim->chunkoid, cim->indexoid, get_cluster_options(stmt));
 			PopActiveSnapshot();
 			CommitTransactionCommand();
 		}
@@ -2724,9 +2977,7 @@ process_create_table_end(Node *parsetree)
 static inline const char *
 typename_get_unqual_name(TypeName *tn)
 {
-	Value *name = llast(tn->names);
-
-	return name->val.str;
+	return strVal(llast(tn->names));
 }
 
 static void
@@ -3016,6 +3267,7 @@ process_altertable_start_table(ProcessUtilityArgs *args)
 				}
 				if (ht != NULL)
 				{
+					EventTriggerAlterTableStart(args->parsetree);
 					result = process_altertable_set_options(cmd, ht);
 				}
 				break;
@@ -3330,6 +3582,10 @@ process_altertable_end_subcmd(Hypertable *ht, Node *parsetree, ObjectAddress *ob
 		case AT_DropOids:
 		case AT_SetOptions:
 		case AT_ResetOptions:
+#if PG14_GE
+		case AT_ReAddStatistics:
+		case AT_SetCompression:
+#endif
 			/* Avoid running this command for distributed hypertable chunks
 			 * since PostgreSQL currently does not allow to alter
 			 * storage options for a foreign table. */
@@ -3411,9 +3667,14 @@ process_altertable_end_subcmd(Hypertable *ht, Node *parsetree, ObjectAddress *ob
 											* process_altertable_start_table but also
 											* here as failsafe */
 		case AT_DetachPartition:
+#if PG14_GE
+		case AT_DetachPartitionFinalize:
+#endif
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("operation not supported on hypertables %d", cmd->subtype)));
+			break;
+		default:
 			break;
 	}
 	if (ts_cm_functions->process_altertable_cmd)
@@ -3699,9 +3960,6 @@ process_ddl_command_start(ProcessUtilityArgs *args)
 		case T_AlterForeignServerStmt:
 			handler = process_alter_foreign_server;
 			break;
-		case T_AlterOwnerStmt:
-			handler = process_alter_owner;
-			break;
 		case T_CreateForeignServerStmt:
 			handler = process_create_foreign_server_start;
 			break;
@@ -3772,7 +4030,7 @@ process_ddl_command_start(ProcessUtilityArgs *args)
 	}
 
 	if (handler == NULL)
-		return false;
+		return DDL_CONTINUE;
 
 	if (check_read_only)
 #if PG13_GE
@@ -3970,6 +4228,9 @@ process_ddl_sql_drop(EventTriggerDropObject *obj)
  */
 static void
 timescaledb_ddl_command_start(PlannedStmt *pstmt, const char *query_string,
+#if PG14_GE
+							  bool readonly_tree,
+#endif
 							  ProcessUtilityContext context, ParamListInfo params,
 							  QueryEnvironment *queryEnv, DestReceiver *dest,
 #if PG13_GE
@@ -3979,16 +4240,21 @@ timescaledb_ddl_command_start(PlannedStmt *pstmt, const char *query_string,
 #endif
 )
 {
-	ProcessUtilityArgs args = { .query_string = query_string,
-								.context = context,
-								.params = params,
-								.dest = dest,
-								.completion_tag = completion_tag,
-								.pstmt = pstmt,
-								.parsetree = pstmt->utilityStmt,
-								.queryEnv = queryEnv,
-								.parse_state = make_parsestate(NULL),
-								.hypertable_list = NIL };
+	ProcessUtilityArgs args = {
+		.query_string = query_string,
+		.context = context,
+		.params = params,
+#if PG14_GE
+		.readonly_tree = readonly_tree,
+#endif
+		.dest = dest,
+		.completion_tag = completion_tag,
+		.pstmt = pstmt,
+		.parsetree = pstmt->utilityStmt,
+		.queryEnv = queryEnv,
+		.parse_state = make_parsestate(NULL),
+		.hypertable_list = NIL
+	};
 
 	bool altering_timescaledb = false;
 	DDLResult result;

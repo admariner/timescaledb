@@ -27,8 +27,8 @@
 #include <utils/timestamp.h>
 
 #include "partitioning.h"
-#include "compat.h"
-#include "catalog.h"
+#include "compat/compat.h"
+#include "ts_catalog/catalog.h"
 #include "utils.h"
 
 #define IS_VALID_CLOSED_PARTITIONING_FUNC(proform, argtype)                                        \

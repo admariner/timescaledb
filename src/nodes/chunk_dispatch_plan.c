@@ -18,7 +18,7 @@
 #include "chunk_dispatch_state.h"
 #include "hypertable.h"
 
-#include "compat.h"
+#include "compat/compat.h"
 
 /*
  * Create a ChunkDispatchState node from this plan. This is the full execution
@@ -91,7 +91,11 @@ ts_chunk_dispatch_path_create(PlannerInfo *root, ModifyTablePath *mtpath, Index 
 							  int subpath_index)
 {
 	ChunkDispatchPath *path = (ChunkDispatchPath *) palloc0(sizeof(ChunkDispatchPath));
+#if PG14_LT
 	Path *subpath = list_nth(mtpath->subpaths, subpath_index);
+#else
+	Path *subpath = mtpath->subpath;
+#endif
 	RangeTblEntry *rte = planner_rt_fetch(hypertable_rti, root);
 
 	memcpy(&path->cpath.path, subpath, sizeof(Path));

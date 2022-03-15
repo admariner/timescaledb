@@ -31,11 +31,12 @@
 #include <utils/relcache.h>
 #include <utils/syscache.h>
 
-#include "compat.h"
+#include "compat/compat.h"
 #include "chunk.h"
+#include "guc.h"
+#include "hypertable_cache.h"
 #include "utils.h"
 #include "time_utils.h"
-#include "guc.h"
 
 TS_FUNCTION_INFO_V1(ts_pg_timestamp_to_unix_microseconds);
 
@@ -569,7 +570,15 @@ ts_get_function_oid(const char *funcname, const char *schema_name, int nargs, Oi
 		list_make2(makeString(pstrdup(schema_name)), makeString(pstrdup(funcname)));
 	FuncCandidateList func_candidates;
 
-	func_candidates = FuncnameGetCandidates(qualified_funcname, nargs, NIL, false, false, false);
+	func_candidates = FuncnameGetCandidates(qualified_funcname,
+											nargs,
+											NIL,
+											false,
+#if PG14_GE
+											false, /* include_out_arguments */
+#endif
+											false,
+											false);
 	while (func_candidates != NULL)
 	{
 		if (func_candidates->nargs == nargs &&
@@ -709,12 +718,15 @@ ts_get_appendrelinfo(PlannerInfo *root, Index rti, bool missing_ok)
 	return NULL;
 }
 
+#if PG12
 /*
  * Find an equivalence class member expression, all of whose Vars, come from
  * the indicated relation.
  *
  * This function has been copied from find_em_expr_for_rel in
  * contrib/postgres_fdw/postgres_fdw.c in postgres source.
+ * This function was moved to postgres main in PG13 so we only need this
+ * backport for PG12 in later versions we will use the postgres implementation.
  */
 Expr *
 ts_find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel)
@@ -739,6 +751,7 @@ ts_find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel)
 	/* We didn't find any suitable equivalence class expression */
 	return NULL;
 }
+#endif
 
 bool
 ts_has_row_security(Oid relid)
@@ -814,4 +827,268 @@ ts_get_integer_now_func(const Dimension *open_dim)
 				  errhint("return type of function does not match dimension type"))));
 
 	return now_func;
+}
+
+/* subtract passed in interval from the now.
+ * Arguments:
+ * now_func : function used to compute now.
+ * interval : integer value
+ * Returns:
+ *  now_func() - interval
+ */
+int64
+ts_sub_integer_from_now(int64 interval, Oid time_dim_type, Oid now_func)
+{
+	Datum now;
+	int64 res;
+
+	AssertArg(IS_INTEGER_TYPE(time_dim_type));
+
+	now = OidFunctionCall0(now_func);
+	switch (time_dim_type)
+	{
+		case INT2OID:
+			res = DatumGetInt16(now) - interval;
+			if (res < PG_INT16_MIN || res > PG_INT16_MAX)
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERVAL_FIELD_OVERFLOW),
+						 errmsg("integer time overflow")));
+			return res;
+		case INT4OID:
+			res = DatumGetInt32(now) - interval;
+			if (res < PG_INT32_MIN || res > PG_INT32_MAX)
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERVAL_FIELD_OVERFLOW),
+						 errmsg("integer time overflow")));
+			return res;
+		case INT8OID:
+		{
+			bool overflow = pg_sub_s64_overflow(DatumGetInt64(now), interval, &res);
+			if (overflow)
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERVAL_FIELD_OVERFLOW),
+						 errmsg("integer time overflow")));
+			}
+			return res;
+		}
+		default:
+			pg_unreachable();
+	}
+}
+
+TS_FUNCTION_INFO_V1(ts_subtract_integer_from_now);
+Datum
+ts_subtract_integer_from_now(PG_FUNCTION_ARGS)
+{
+	Oid ht_relid = PG_GETARG_OID(0);
+	int64 lag = PG_GETARG_INT64(1);
+	Cache *hcache;
+	Hypertable *ht = ts_hypertable_cache_get_cache_and_entry(ht_relid, CACHE_FLAG_NONE, &hcache);
+	const Dimension *dim = hyperspace_get_open_dimension(ht->space, 0);
+
+	if (!dim)
+		elog(ERROR, "hypertable has no open partitioning dimension");
+
+	Oid partitioning_type = ts_dimension_get_partition_type(dim);
+
+	if (!IS_INTEGER_TYPE(partitioning_type))
+		elog(ERROR, "hypertable has no integer partitioning dimension");
+
+	Oid now_func = ts_get_integer_now_func(dim);
+	if (!OidIsValid(now_func))
+		elog(ERROR, "could not find valid integer_now function for hypertable");
+
+	int64 res = ts_sub_integer_from_now(lag, partitioning_type, now_func);
+	ts_cache_release(hcache);
+	return Int64GetDatum(res);
+}
+
+TS_FUNCTION_INFO_V1(ts_relation_size);
+Datum
+ts_relation_size(PG_FUNCTION_ARGS)
+{
+	Oid relid = PG_ARGISNULL(0) ? InvalidOid : PG_GETARG_OID(0);
+	RelationSize relsize = { 0 };
+	TupleDesc tupdesc;
+	HeapTuple tuple;
+	Datum values[4] = { 0 };
+	bool nulls[4] = { false };
+
+	/* Build a tuple descriptor for our result type */
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("function returning record called in context "
+						"that cannot accept type record")));
+
+	if (!OidIsValid(relid))
+		PG_RETURN_NULL();
+
+	relsize = ts_relation_size_impl(relid);
+
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	values[0] = Int64GetDatum(relsize.total_size);
+	values[1] = Int64GetDatum(relsize.heap_size);
+	values[2] = Int64GetDatum(relsize.index_size);
+	values[3] = Int64GetDatum(relsize.toast_size);
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+
+	return HeapTupleGetDatum(tuple);
+}
+
+RelationSize
+ts_relation_size_impl(Oid relid)
+{
+	RelationSize relsize = { 0 };
+	Datum reloid = ObjectIdGetDatum(relid);
+	Relation rel;
+
+	/* Open relation earlier to keep a lock during all function calls */
+	rel = try_relation_open(relid, AccessShareLock);
+
+	if (!rel)
+		return relsize;
+
+	/* Get to total relation size to be our calculation base */
+	relsize.total_size = DatumGetInt64(DirectFunctionCall1(pg_total_relation_size, reloid));
+
+	/* Get the indexes size of the relation (don't consider TOAST indexes) */
+	relsize.index_size = DatumGetInt64(DirectFunctionCall1(pg_indexes_size, reloid));
+
+	/* If exists an associated TOAST calculate the total size (including indexes) */
+	if (OidIsValid(rel->rd_rel->reltoastrelid))
+		relsize.toast_size =
+			DatumGetInt64(DirectFunctionCall1(pg_total_relation_size,
+											  ObjectIdGetDatum(rel->rd_rel->reltoastrelid)));
+	else
+		relsize.toast_size = 0;
+
+	relation_close(rel, AccessShareLock);
+
+	/* Calculate the HEAP size based on the total size and indexes plus toast */
+	relsize.heap_size = relsize.total_size - (relsize.index_size + relsize.toast_size);
+
+	return relsize;
+}
+
+#define STR_VALUE(str) #str
+#define NODE_CASE(name)                                                                            \
+	case T_##name:                                                                                 \
+		return STR_VALUE(name)
+
+/*
+ * Return a string with the name of the node.
+ *
+ */
+const char *
+ts_get_node_name(Node *node)
+{
+	/* tags are defined in nodes/nodes.h postgres source */
+	switch (nodeTag(node))
+	{
+		/*
+		 * plan nodes (plannodes.h)
+		 */
+		NODE_CASE(Plan);
+		NODE_CASE(Result);
+		NODE_CASE(ProjectSet);
+		NODE_CASE(ModifyTable);
+		NODE_CASE(Append);
+		NODE_CASE(MergeAppend);
+		NODE_CASE(RecursiveUnion);
+		NODE_CASE(BitmapAnd);
+		NODE_CASE(BitmapOr);
+		NODE_CASE(Scan);
+		NODE_CASE(SeqScan);
+		NODE_CASE(SampleScan);
+		NODE_CASE(IndexScan);
+		NODE_CASE(IndexOnlyScan);
+		NODE_CASE(BitmapIndexScan);
+		NODE_CASE(BitmapHeapScan);
+		NODE_CASE(TidScan);
+		NODE_CASE(SubqueryScan);
+		NODE_CASE(FunctionScan);
+		NODE_CASE(ValuesScan);
+		NODE_CASE(TableFuncScan);
+		NODE_CASE(CteScan);
+		NODE_CASE(NamedTuplestoreScan);
+		NODE_CASE(WorkTableScan);
+		NODE_CASE(ForeignScan);
+		NODE_CASE(CustomScan);
+		NODE_CASE(Join);
+		NODE_CASE(NestLoop);
+		NODE_CASE(MergeJoin);
+		NODE_CASE(HashJoin);
+		NODE_CASE(Material);
+		NODE_CASE(Sort);
+		NODE_CASE(Group);
+		NODE_CASE(Agg);
+		NODE_CASE(WindowAgg);
+		NODE_CASE(Unique);
+		NODE_CASE(Gather);
+		NODE_CASE(GatherMerge);
+		NODE_CASE(Hash);
+		NODE_CASE(SetOp);
+		NODE_CASE(LockRows);
+		NODE_CASE(Limit);
+
+		/*
+		 * planner nodes (pathnodes.h)
+		 */
+		NODE_CASE(IndexPath);
+		NODE_CASE(BitmapHeapPath);
+		NODE_CASE(BitmapAndPath);
+		NODE_CASE(BitmapOrPath);
+		NODE_CASE(TidPath);
+		NODE_CASE(SubqueryScanPath);
+		NODE_CASE(ForeignPath);
+		NODE_CASE(NestPath);
+		NODE_CASE(MergePath);
+		NODE_CASE(HashPath);
+		NODE_CASE(AppendPath);
+		NODE_CASE(MergeAppendPath);
+		NODE_CASE(GroupResultPath);
+		NODE_CASE(MaterialPath);
+		NODE_CASE(UniquePath);
+		NODE_CASE(GatherPath);
+		NODE_CASE(GatherMergePath);
+		NODE_CASE(ProjectionPath);
+		NODE_CASE(ProjectSetPath);
+		NODE_CASE(SortPath);
+		NODE_CASE(GroupPath);
+		NODE_CASE(UpperUniquePath);
+		NODE_CASE(AggPath);
+		NODE_CASE(GroupingSetsPath);
+		NODE_CASE(MinMaxAggPath);
+		NODE_CASE(WindowAggPath);
+		NODE_CASE(SetOpPath);
+		NODE_CASE(RecursiveUnionPath);
+		NODE_CASE(LockRowsPath);
+		NODE_CASE(ModifyTablePath);
+		NODE_CASE(LimitPath);
+
+		case T_Path:
+			switch (castNode(Path, node)->pathtype)
+			{
+				NODE_CASE(SeqScan);
+				NODE_CASE(SampleScan);
+				NODE_CASE(SubqueryScan);
+				NODE_CASE(FunctionScan);
+				NODE_CASE(TableFuncScan);
+				NODE_CASE(ValuesScan);
+				NODE_CASE(CteScan);
+				NODE_CASE(WorkTableScan);
+				default:
+					return psprintf("Path (%d)", castNode(Path, node)->pathtype);
+			}
+
+		case T_CustomPath:
+			return psprintf("CustomPath (%s)", castNode(CustomPath, node)->methods->CustomName);
+
+		default:
+			return psprintf("Node (%d)", nodeTag(node));
+	}
 }

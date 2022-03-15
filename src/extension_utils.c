@@ -26,6 +26,7 @@
 #include <utils/lsyscache.h>
 #include <utils/rel.h>
 
+#include "compat/compat.h"
 #include "extension_constants.h"
 
 #define EXTENSION_PROXY_TABLE "cache_inval_extension"
@@ -82,7 +83,7 @@ extension_version(void)
 				Anum_pg_extension_extname,
 				BTEqualStrategyNumber,
 				F_NAMEEQ,
-				DirectFunctionCall1(namein, CStringGetDatum(EXTENSION_NAME)));
+				CStringGetDatum(EXTENSION_NAME));
 
 	scandesc = systable_beginscan(rel, ExtensionNameIndexId, true, NULL, 1, entry);
 
@@ -185,7 +186,7 @@ extension_load_without_preload()
 		 */
 		/* Only privileged users can get the value of `config file` */
 
-		if (is_member_of_role(GetUserId(), DEFAULT_ROLE_READ_ALL_SETTINGS))
+		if (has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_SETTINGS))
 		{
 			char *config_file = GetConfigOptionByName("config_file", NULL, false);
 

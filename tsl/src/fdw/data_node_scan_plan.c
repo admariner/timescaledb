@@ -23,14 +23,13 @@
 #include <utils/memutils.h>
 
 #include <export.h>
-#include <chunk_data_node.h>
 #include <hypertable_cache.h>
 #include <planner.h>
 #include <import/allpaths.h>
 #include <import/planner.h>
 #include <func_cache.h>
 #include <dimension.h>
-#include <compat.h>
+#include <compat/compat.h>
 #include <debug_guc.h>
 #include <debug.h>
 
@@ -294,7 +293,11 @@ force_group_by_push_down(PlannerInfo *root, RelOptInfo *hyper_rel)
 {
 	PartitionScheme partscheme = hyper_rel->part_scheme;
 	List *groupexprs;
+	List **nullable_partexprs;
 	int16 new_partnatts;
+	Oid *partopfamily;
+	Oid *partopcintype;
+	Oid *partcollation;
 	ListCell *lc;
 	int i = 0;
 
@@ -303,10 +306,29 @@ force_group_by_push_down(PlannerInfo *root, RelOptInfo *hyper_rel)
 	groupexprs = get_sortgrouplist_exprs(root->parse->groupClause, root->parse->targetList);
 	new_partnatts = list_length(groupexprs);
 
-	/* Only reallocate the partitioning attributes array if it is smaller than
-	 * the new size */
+	/* Only reallocate the partitioning attributes arrays if it is smaller than
+	 * the new size. palloc0 is needed to zero out the extra space. */
 	if (partscheme->partnatts < new_partnatts)
+	{
+		partopfamily = palloc0(new_partnatts * sizeof(Oid));
+		partopcintype = palloc0(new_partnatts * sizeof(Oid));
+		partcollation = palloc0(new_partnatts * sizeof(Oid));
+		nullable_partexprs = palloc0(new_partnatts * sizeof(List *));
+
+		memcpy(partopfamily, partscheme->partopfamily, partscheme->partnatts * sizeof(Oid));
+		memcpy(partopcintype, partscheme->partopcintype, partscheme->partnatts * sizeof(Oid));
+		memcpy(partcollation, partscheme->partcollation, partscheme->partnatts * sizeof(Oid));
+		memcpy(nullable_partexprs,
+			   hyper_rel->nullable_partexprs,
+			   partscheme->partnatts * sizeof(List *));
+
+		partscheme->partopfamily = partopfamily;
+		partscheme->partopcintype = partopcintype;
+		partscheme->partcollation = partcollation;
+		hyper_rel->nullable_partexprs = nullable_partexprs;
+
 		hyper_rel->partexprs = (List **) palloc0(sizeof(List *) * new_partnatts);
+	}
 
 	partscheme->partnatts = new_partnatts;
 
@@ -595,7 +617,12 @@ data_node_scan_plan_create(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_
 		bms_free(attrs_used);
 	}
 
-	cscan->custom_private = list_make2(scaninfo.fdw_private, list_make1_int(scaninfo.systemcol));
+	/* Should have determined the fetcher type by now. */
+	Assert(ts_data_node_fetcher_scan_type != AutoFetcherType);
+
+	cscan->custom_private = list_make3(scaninfo.fdw_private,
+									   list_make1_int(scaninfo.systemcol),
+									   makeInteger(ts_data_node_fetcher_scan_type));
 
 	return &cscan->scan.plan;
 }

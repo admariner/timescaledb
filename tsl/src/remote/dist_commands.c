@@ -12,6 +12,8 @@
 #include <utils/lsyscache.h>
 #include <utils/syscache.h>
 
+#include <utils.h>
+
 #include "dist_commands.h"
 #include "dist_txn.h"
 #include "connection_cache.h"
@@ -74,46 +76,53 @@ ts_dist_cmd_collect_responses(List *requests)
 }
 
 /*
- * Invoke a SQL statement (command) on the given data nodes.
+ * Invoke multiple SQL statements (commands) on the given data nodes.
  *
  * The list of data nodes can either be a list of data node names, or foreign
  * server OIDs.
  *
  * If "transactional" is false then it means that the SQL should be executed
  * in autocommit (implicit statement level commit) mode without the need for
- * an explicit 2PC from the access node
+ * an explicit 2PC from the access node.
  */
 DistCmdResult *
-ts_dist_cmd_params_invoke_on_data_nodes(const char *sql, StmtParams *params, List *data_nodes,
-										bool transactional)
+ts_dist_multi_cmds_params_invoke_on_data_nodes(List *cmd_descriptors, List *data_nodes,
+											   bool transactional)
 {
-	ListCell *lc;
+	ListCell *lc_data_node, *lc_cmd_descr;
 	List *requests = NIL;
 	DistCmdResult *results;
 
 	if (data_nodes == NIL)
-		elog(ERROR, "target data nodes must be specified for ts_dist_cmd_invoke_on_data_nodes");
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("no data nodes to execute command on"),
+				 errhint("Add data nodes before executing a distributed command.")));
 
+	Assert(list_length(data_nodes) == list_length(cmd_descriptors));
 	switch (nodeTag(data_nodes))
 	{
 		case T_OidList:
-			data_nodes = data_node_oids_to_node_name_list(data_nodes, ACL_USAGE);
+			data_nodes = data_node_oids_to_node_name_list(data_nodes, ACL_NO_CHECK);
 			break;
 		case T_List:
-			/* Already in the format we want. Just check permissions. */
-			data_node_name_list_check_acl(data_nodes, ACL_USAGE);
+			/* Already in the format we want */
+			data_node_name_list_check_acl(data_nodes, ACL_NO_CHECK);
 			break;
 		default:
 			elog(ERROR, "invalid list type %u", nodeTag(data_nodes));
 			break;
 	}
 
-	foreach (lc, data_nodes)
+	forboth (lc_data_node, data_nodes, lc_cmd_descr, cmd_descriptors)
 	{
-		const char *node_name = lfirst(lc);
+		const char *node_name = lfirst(lc_data_node);
 		AsyncRequest *req;
 		TSConnection *connection =
 			data_node_get_connection(node_name, REMOTE_TXN_NO_PREP_STMT, transactional);
+		DistCmdDescr *cmd_descr = lfirst(lc_cmd_descr);
+		const char *sql = cmd_descr->sql;
+		StmtParams *params = cmd_descr->params;
 
 		ereport(DEBUG2, (errmsg_internal("sending \"%s\" to data node \"%s\"", sql, node_name)));
 
@@ -130,6 +139,24 @@ ts_dist_cmd_params_invoke_on_data_nodes(const char *sql, StmtParams *params, Lis
 	list_free(requests);
 	Assert(ts_dist_cmd_response_count(results) == list_length(data_nodes));
 
+	return results;
+}
+
+DistCmdResult *
+ts_dist_cmd_params_invoke_on_data_nodes(const char *sql, StmtParams *params, List *data_nodes,
+										bool transactional)
+{
+	List *cmd_descriptors = NIL;
+	DistCmdDescr cmd_descr = { .sql = sql, .params = params };
+	DistCmdResult *results;
+
+	for (int i = 0; i < list_length(data_nodes); ++i)
+	{
+		cmd_descriptors = lappend(cmd_descriptors, &cmd_descr);
+	}
+	results =
+		ts_dist_multi_cmds_params_invoke_on_data_nodes(cmd_descriptors, data_nodes, transactional);
+	list_free(cmd_descriptors);
 	return results;
 }
 
@@ -159,6 +186,41 @@ ts_dist_cmd_invoke_on_data_nodes_using_search_path(const char *sql, const char *
 	}
 
 	results = ts_dist_cmd_invoke_on_data_nodes(sql, node_names, transactional);
+
+	if (set_search_path)
+	{
+		set_result = ts_dist_cmd_invoke_on_data_nodes("SET search_path = pg_catalog",
+													  node_names,
+													  transactional);
+		if (set_result)
+			ts_dist_cmd_close_response(set_result);
+	}
+
+	return results;
+}
+
+DistCmdResult *
+ts_dist_multi_cmds_invoke_on_data_nodes_using_search_path(List *cmd_descriptors,
+														  const char *search_path, List *node_names,
+														  bool transactional)
+{
+	DistCmdResult *set_result;
+	DistCmdResult *results;
+	bool set_search_path = search_path != NULL;
+
+	if (set_search_path)
+	{
+		char *set_request = psprintf("SET search_path = %s, pg_catalog", search_path);
+
+		set_result = ts_dist_cmd_invoke_on_data_nodes(set_request, node_names, transactional);
+		if (set_result)
+			ts_dist_cmd_close_response(set_result);
+
+		pfree(set_request);
+	}
+
+	results =
+		ts_dist_multi_cmds_params_invoke_on_data_nodes(cmd_descriptors, node_names, transactional);
 
 	if (set_search_path)
 	{
@@ -380,7 +442,10 @@ ts_dist_cmd_prepare_command(const char *sql, size_t n_params, List *node_names)
 	AsyncResponseResult *async_resp;
 
 	if (node_names == NIL)
-		elog(ERROR, "target data nodes must be specified for ts_dist_cmd_prepare_command");
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid data nodes list"),
+				 errdetail("Must specify a non-empty list of data nodes.")));
 
 	foreach (lc, node_names)
 	{
@@ -454,7 +519,7 @@ ts_dist_cmd_exec(PG_FUNCTION_ARGS)
 	const char *search_path;
 
 	if (!transactional)
-		PreventInTransactionBlock(true, get_func_name(FC_FN_OID(fcinfo)));
+		TS_PREVENT_IN_TRANSACTION_BLOCK(true);
 
 	if (NULL == query)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("empty command string")));
@@ -467,8 +532,40 @@ ts_dist_cmd_exec(PG_FUNCTION_ARGS)
 	if (data_nodes == NULL)
 		data_node_list = data_node_get_node_name_list();
 	else
-		data_node_list = data_node_array_to_node_name_list(data_nodes);
+	{
+		int ndatanodes;
 
+		if (ARR_NDIM(data_nodes) > 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid data nodes list"),
+					 errdetail("The array of data nodes cannot be multi-dimensional.")));
+
+		if (ARR_HASNULL(data_nodes))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid data nodes list"),
+					 errdetail("The array of data nodes cannot contain null values.")));
+
+		ndatanodes = ArrayGetNItems(ARR_NDIM(data_nodes), ARR_DIMS(data_nodes));
+
+		if (ndatanodes == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid data nodes list"),
+					 errdetail("The array of data nodes cannot be empty.")));
+
+		data_node_list = data_node_array_to_node_name_list(data_nodes);
+	}
+
+	/* Assert that the data node list is not empty. Since we checked that the
+	 * function is run on an access node above, the list of data nodes must
+	 * per definition be non-empty for the case when not specifying an
+	 * explicit list of data nodes. For the case of explicitly specifying data
+	 * nodes, we already checked for a non-empty array, and then validated all
+	 * the specified data nodes. If there was a node in the list that is not a
+	 * data node, we would already have thrown an error. */
+	Assert(data_node_list != NIL);
 	search_path = GetConfigOption("search_path", false, false);
 	result = ts_dist_cmd_invoke_on_data_nodes_using_search_path(query,
 																search_path,

@@ -25,20 +25,22 @@
 #include <libpq-fe.h>
 
 #include <remote/dist_commands.h>
-#include "compat.h"
+#include "compat/compat.h"
 #include "cache.h"
 #include "chunk.h"
 #include "errors.h"
 #include "hypertable.h"
 #include "hypertable_cache.h"
-#include "hypertable_compression.h"
+#include "ts_catalog/continuous_agg.h"
+#include "ts_catalog/hypertable_compression.h"
+#include "ts_catalog/compression_chunk_size.h"
 #include "create.h"
 #include "compress_utils.h"
 #include "compression.h"
-#include "compat.h"
+#include "compat/compat.h"
 #include "scanner.h"
 #include "scan_iterator.h"
-#include "compression_chunk_size.h"
+#include "utils.h"
 
 typedef struct CompressChunkCxt
 {
@@ -47,39 +49,9 @@ typedef struct CompressChunkCxt
 	Hypertable *compress_ht; /*compressed table for srcht */
 } CompressChunkCxt;
 
-typedef struct
-{
-	int64 heap_size;
-	int64 toast_size;
-	int64 index_size;
-} ChunkSize;
-
-static ChunkSize
-compute_chunk_size(Oid chunk_relid)
-{
-	int64 tot_size;
-	int i = 0;
-	ChunkSize ret;
-	Datum relid = ObjectIdGetDatum(chunk_relid);
-	char *filtyp[] = { "main", "init", "fsm", "vm" };
-	/* for heap get size from fsm, vm, init and main as this is included in
-	 * pg_table_size calculation
-	 */
-	ret.heap_size = 0;
-	for (i = 0; i < 4; i++)
-	{
-		ret.heap_size += DatumGetInt64(
-			DirectFunctionCall2(pg_relation_size, relid, CStringGetTextDatum(filtyp[i])));
-	}
-	ret.index_size = DatumGetInt64(DirectFunctionCall1(pg_indexes_size, relid));
-	tot_size = DatumGetInt64(DirectFunctionCall1(pg_table_size, relid));
-	ret.toast_size = tot_size - ret.heap_size;
-	return ret;
-}
-
 static void
-compression_chunk_size_catalog_insert(int32 src_chunk_id, ChunkSize *src_size,
-									  int32 compress_chunk_id, ChunkSize *compress_size,
+compression_chunk_size_catalog_insert(int32 src_chunk_id, const RelationSize *src_size,
+									  int32 compress_chunk_id, const RelationSize *compress_size,
 									  int64 rowcnt_pre_compression, int64 rowcnt_post_compression)
 {
 	Catalog *catalog = ts_catalog_get();
@@ -123,6 +95,27 @@ compression_chunk_size_catalog_insert(int32 src_chunk_id, ChunkSize *src_size,
 }
 
 static void
+get_hypertable_or_cagg_name(Hypertable *ht, Name objname)
+{
+	ContinuousAggHypertableStatus status = ts_continuous_agg_hypertable_status(ht->fd.id);
+	if (status == HypertableIsNotContinuousAgg)
+		namestrcpy(objname, NameStr(ht->fd.table_name));
+	else if (status == HypertableIsMaterialization)
+	{
+		ContinuousAgg *cagg = ts_continuous_agg_find_by_mat_hypertable_id(ht->fd.id);
+		namestrcpy(objname, NameStr(cagg->data.user_view_name));
+	}
+	else
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("unexpected hypertable status for %s %d",
+						NameStr(ht->fd.table_name),
+						status)));
+	}
+}
+
+static void
 compresschunkcxt_init(CompressChunkCxt *cxt, Cache *hcache, Oid hypertable_relid, Oid chunk_relid)
 {
 	Hypertable *srcht = ts_hypertable_cache_get_entry(hcache, hypertable_relid, CACHE_FLAG_NONE);
@@ -132,14 +125,17 @@ compresschunkcxt_init(CompressChunkCxt *cxt, Cache *hcache, Oid hypertable_relid
 	ts_hypertable_permissions_check(srcht->main_table_relid, GetUserId());
 
 	if (!TS_HYPERTABLE_HAS_COMPRESSION_TABLE(srcht))
+	{
+		NameData cagg_ht_name;
+		get_hypertable_or_cagg_name(srcht, &cagg_ht_name);
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("compression not enabled on \"%s\"", NameStr(srcht->fd.table_name)),
-				 errdetail("It is not possible to compress chunks on a hypertable"
-						   " that does not have compression enabled."),
-				 errhint("Enable compression using ALTER TABLE with"
+				 errmsg("compression not enabled on \"%s\"", NameStr(cagg_ht_name)),
+				 errdetail("It is not possible to compress chunks on a hypertable or"
+						   " continuous aggregate that does not have compression enabled."),
+				 errhint("Enable compression using ALTER TABLE/MATERIALIZED VIEW with"
 						 " the timescaledb.compress option.")));
-
+	}
 	compress_ht = ts_hypertable_get_by_id(srcht->fd.compressed_hypertable_id);
 	if (compress_ht == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR), errmsg("missing compress hypertable")));
@@ -219,7 +215,7 @@ compress_chunk_impl(Oid hypertable_relid, Oid chunk_relid)
 	List *htcols_list = NIL;
 	const ColumnCompressionInfo **colinfo_array;
 	int i = 0, htcols_listlen;
-	ChunkSize before_size, after_size;
+	RelationSize before_size, after_size;
 	CompressionStats cstat;
 
 	hcache = ts_hypertable_cache_pin();
@@ -250,7 +246,7 @@ compress_chunk_impl(Oid hypertable_relid, Oid chunk_relid)
 		FormData_hypertable_compression *fd = (FormData_hypertable_compression *) lfirst(lc);
 		colinfo_array[i++] = fd;
 	}
-	before_size = compute_chunk_size(cxt.srcht_chunk->table_id);
+	before_size = ts_relation_size_impl(cxt.srcht_chunk->table_id);
 	cstat = compress_chunk(cxt.srcht_chunk->table_id,
 						   compress_ht_chunk->table_id,
 						   colinfo_array,
@@ -272,7 +268,7 @@ compress_chunk_impl(Oid hypertable_relid, Oid chunk_relid)
 	 * directly on the hypertable or chunks.
 	 */
 	ts_chunk_drop_fks(cxt.srcht_chunk);
-	after_size = compute_chunk_size(compress_ht_chunk->table_id);
+	after_size = ts_relation_size_impl(compress_ht_chunk->table_id);
 	compression_chunk_size_catalog_insert(cxt.srcht_chunk->fd.id,
 										  &before_size,
 										  compress_ht_chunk->fd.id,
@@ -439,6 +435,7 @@ tsl_compress_chunk(PG_FUNCTION_ARGS)
 {
 	Oid uncompressed_chunk_id = PG_ARGISNULL(0) ? InvalidOid : PG_GETARG_OID(0);
 	bool if_not_compressed = PG_ARGISNULL(1) ? false : PG_GETARG_BOOL(1);
+	TS_PREVENT_FUNC_IF_READ_ONLY();
 	Chunk *chunk = ts_chunk_get_by_relid(uncompressed_chunk_id, true);
 
 	if (chunk->relkind == RELKIND_FOREIGN_TABLE)
@@ -468,6 +465,7 @@ tsl_decompress_chunk(PG_FUNCTION_ARGS)
 {
 	Oid uncompressed_chunk_id = PG_ARGISNULL(0) ? InvalidOid : PG_GETARG_OID(0);
 	bool if_compressed = PG_ARGISNULL(1) ? false : PG_GETARG_BOOL(1);
+	TS_PREVENT_FUNC_IF_READ_ONLY();
 	Chunk *uncompressed_chunk = ts_chunk_get_by_relid(uncompressed_chunk_id, true);
 
 	if (NULL == uncompressed_chunk)
@@ -502,71 +500,6 @@ tsl_decompress_chunk(PG_FUNCTION_ARGS)
 	PG_RETURN_OID(uncompressed_chunk_id);
 }
 
-/* setup FunctionCallInfo for compress_chunk/decompress_chunk
- * alloc memory for decompfn_fcinfo and init it.
- */
-static void
-get_compression_fcinfo(char *fname, FmgrInfo *decompfn, FunctionCallInfo *decompfn_fcinfo,
-					   FunctionCallInfo orig_fcinfo)
-{
-	/* compress_chunk, decompress_chunk have the same args */
-	Oid argtyp[] = { REGCLASSOID, BOOLOID };
-	fmNodePtr cxt =
-		orig_fcinfo->context; /* pass in the context from the current FunctionCallInfo */
-
-	Oid decomp_func_oid =
-		LookupFuncName(list_make1(makeString(fname)), lengthof(argtyp), argtyp, false);
-
-	fmgr_info(decomp_func_oid, decompfn);
-	*decompfn_fcinfo = HEAP_FCINFO(2);
-	InitFunctionCallInfoData(**decompfn_fcinfo,
-							 decompfn,
-							 2,
-							 InvalidOid, /* collation */
-							 cxt,
-							 NULL);
-	FC_ARG(*decompfn_fcinfo, 0) = FC_ARG(orig_fcinfo, 0);
-	FC_NULL(*decompfn_fcinfo, 0) = FC_NULL(orig_fcinfo, 0);
-	FC_ARG(*decompfn_fcinfo, 1) = FC_ARG(orig_fcinfo, 1);
-	FC_NULL(*decompfn_fcinfo, 1) = FC_NULL(orig_fcinfo, 1);
-}
-
-static Datum
-tsl_recompress_remote_chunk(Chunk *uncompressed_chunk, FunctionCallInfo fcinfo, bool if_compressed)
-{
-	FmgrInfo decompfn;
-	FmgrInfo compfn;
-	FunctionCallInfo decompfn_fcinfo;
-	FunctionCallInfo compfn_fcinfo;
-	get_compression_fcinfo(DECOMPRESS_CHUNK_FUNCNAME, &decompfn, &decompfn_fcinfo, fcinfo);
-
-	FunctionCallInvoke(decompfn_fcinfo);
-	if (decompfn_fcinfo->isnull)
-	{
-		ereport((if_compressed ? NOTICE : ERROR),
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("decompression failed for chunk \"%s\"",
-						get_rel_name(uncompressed_chunk->table_id)),
-				 errdetail("The compression status for the chunk is %d",
-						   uncompressed_chunk->fd.status)));
-
-		PG_RETURN_NULL();
-	}
-	get_compression_fcinfo(COMPRESS_CHUNK_FUNCNAME, &compfn, &compfn_fcinfo, fcinfo);
-	Datum compoid = FunctionCallInvoke(compfn_fcinfo);
-	if (compfn_fcinfo->isnull)
-	{
-		ereport((if_compressed ? NOTICE : ERROR),
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("compression failed for chunk \"%s\"",
-						get_rel_name(uncompressed_chunk->table_id)),
-				 errdetail("The compression status for the chunk is %d",
-						   uncompressed_chunk->fd.status)));
-		PG_RETURN_NULL();
-	}
-	return compoid;
-}
-
 bool
 tsl_recompress_chunk_wrapper(Chunk *uncompressed_chunk)
 {
@@ -582,38 +515,4 @@ tsl_recompress_chunk_wrapper(Chunk *uncompressed_chunk)
 	Assert(!ts_chunk_is_compressed(chunk));
 	tsl_compress_chunk_wrapper(chunk, false);
 	return true;
-}
-
-Datum
-tsl_recompress_chunk(PG_FUNCTION_ARGS)
-{
-	Oid uncompressed_chunk_id = PG_ARGISNULL(0) ? InvalidOid : PG_GETARG_OID(0);
-	bool if_compressed = PG_ARGISNULL(1) ? false : PG_GETARG_BOOL(1);
-	Chunk *uncompressed_chunk =
-		ts_chunk_get_by_relid(uncompressed_chunk_id, true /* fail_if_not_found */);
-	if (!ts_chunk_is_unordered(uncompressed_chunk))
-	{
-		if (!ts_chunk_is_compressed(uncompressed_chunk))
-		{
-			ereport((if_compressed ? NOTICE : ERROR),
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("call compress_chunk instead of recompress_chunk")));
-			PG_RETURN_NULL();
-		}
-		else
-		{
-			ereport((if_compressed ? NOTICE : ERROR),
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("nothing to recompress in chunk \"%s\" ",
-							get_rel_name(uncompressed_chunk->table_id))));
-			PG_RETURN_NULL();
-		}
-	}
-	if (uncompressed_chunk->relkind == RELKIND_FOREIGN_TABLE)
-		return tsl_recompress_remote_chunk(uncompressed_chunk, fcinfo, if_compressed);
-	else
-	{
-		tsl_recompress_chunk_wrapper(uncompressed_chunk);
-		PG_RETURN_OID(uncompressed_chunk_id);
-	}
 }

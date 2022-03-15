@@ -8,8 +8,8 @@
 #include <postgres.h>
 #include <catalog/pg_type.h>
 
-#include <catalog.h>
-#include <chunk.h>
+#include "ts_catalog/catalog.h"
+#include "chunk.h"
 
 #include "with_clause_parser.h"
 
@@ -28,7 +28,7 @@ typedef struct
 	bool asc;
 } CompressedParsedCol;
 
-WithClauseResult *ts_compress_hypertable_set_clause_parse(const List *defelems);
+extern TSDLLEXPORT WithClauseResult *ts_compress_hypertable_set_clause_parse(const List *defelems);
 extern TSDLLEXPORT List *ts_compress_hypertable_parse_segment_by(WithClauseResult *parsed_options,
 																 Hypertable *hypertable);
 extern TSDLLEXPORT List *ts_compress_hypertable_parse_order_by(WithClauseResult *parsed_options,

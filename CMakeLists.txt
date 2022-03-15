@@ -5,9 +5,33 @@ list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 include(CheckCCompilerFlag)
 include(GitCommands)
 include(GenerateScripts)
+include(CMakeDependentOption)
+
+# This requires all tests to run. This defaults to OFF but can be enabled to
+# ensure that no tests are skipped because of missing tools.
+option(REQUIRE_ALL_TESTS "Require all tests to run." OFF)
+option(USE_OPENSSL "Enable use of OpenSSL if available" ON)
+option(SEND_TELEMETRY_DEFAULT "The default value for whether to send telemetry"
+       ON)
+option(
+  USE_TELEMETRY
+  "Include telemetry functionality in the build. Disabling will exclude all telemetry code from the build."
+  ON)
+
+option(REGRESS_CHECKS "PostgreSQL regress checks through installcheck" ON)
+option(
+  ENABLE_OPTIMIZER_DEBUG
+  "Enable OPTIMIZER_DEBUG when building. Requires Postgres server to be built with OPTIMIZER_DEBUG."
+  OFF)
+
+# Option to enable assertions. Note that if we include headers from a PostgreSQL
+# build that has assertions enabled, we might inherit that setting without
+# explicitly enabling assertions via the ASSERTIONS option defined here. Thus,
+# this option is mostly useful to enable assertions when the PostgreSQL we
+# compile against has it disabled.
+option(ASSERTIONS "Compile with assertion checks (default OFF)" OFF)
 
 # Function to call pg_config and extract values.
-#
 function(GET_PG_CONFIG var)
   set(_temp)
 
@@ -63,12 +87,6 @@ if(VERSION_CONFIG
   set(DOWNGRADE_TO_VERSION ${CMAKE_MATCH_1})
 endif()
 
-message(STATUS "VERSION: ${VERSION}")
-message(STATUS "VERSION_MOD: ${VERSION_MOD}")
-message(STATUS "PROJECT_VERSION_MOD: ${PROJECT_VERSION_MOD}")
-message(STATUS "UPDATE_FROM_VERSION: ${UPDATE_FROM_VERSION}")
-message(STATUS "DOWNGRADE_TO_VERSION: ${DOWNGRADE_TO_VERSION}")
-
 # a hack to avoid change of SQL extschema variable
 set(extschema "@extschema@")
 
@@ -119,6 +137,12 @@ option(EXPERIMENTAL "Skip postgres version compatibility check" OFF)
 option(GENERATE_DOWNGRADE_SCRIPT
        "Generate downgrade script. Defaults to not generate a downgrade script."
        OFF)
+cmake_dependent_option(
+  GENERATE_OLD_DOWNGRADE_SCRIPTS
+  "Generate downgrade scripts for old versions. Requires setting GENERATE_DOWNGRADE_SCRIPT to ON. Defaults to OFF."
+  OFF
+  "GENERATE_DOWNGRADE_SCRIPT"
+  ON)
 
 if(CMAKE_BUILD_TYPE MATCHES Debug)
   # CMAKE_BUILD_TYPE is set at CMake configuration type. But usage of
@@ -143,11 +167,9 @@ endif()
 # Option to treat warnings as errors when compiling (default on for debug
 # builds, off for all other build types)
 if(CMAKE_BUILD_TYPE STREQUAL Debug)
-  message(STATUS "CMAKE_BUILD_TYPE matches Debug")
   option(WARNINGS_AS_ERRORS "Make compiler warnings into errors (default ON)"
          ON)
 else()
-  message(STATUS "CMAKE_BUILD_TYPE does not match Debug")
   option(WARNINGS_AS_ERRORS "Make compiler warnings into errors (default ON)"
          OFF)
 endif()
@@ -177,6 +199,7 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|AppleClang|Clang")
     -Wempty-body
     -Wvla
     -Wall
+    -Wundef
     -Wmissing-prototypes
     -Wpointer-arith
     -Werror=vla
@@ -311,8 +334,6 @@ if(GIT_FOUND)
   endif()
 endif()
 
-message(STATUS "Using pg_config ${PG_CONFIG}")
-
 # Check PostgreSQL version
 execute_process(
   COMMAND ${PG_CONFIG} --version
@@ -332,14 +353,14 @@ else()
 endif()
 set(PG_VERSION "${PG_VERSION_MAJOR}.${PG_VERSION_MINOR}")
 
-message(STATUS "Compiling against PostgreSQL version ${PG_VERSION}")
-
 # Ensure that PostgreSQL version is supported and consistent with src/compat.h
 # version check
 if((${PG_VERSION_MAJOR} LESS "12")
-   OR (${PG_VERSION_MAJOR} GREATER "13")
+   OR (${PG_VERSION_MAJOR} GREATER "14")
    AND NOT (${EXPERIMENTAL}))
-  message(FATAL_ERROR "TimescaleDB only supports PostgreSQL 12 and 13")
+  message(FATAL_ERROR "TimescaleDB only supports PostgreSQL 12, 13 and 14")
+else()
+  message(STATUS "Compiling against PostgreSQL version ${PG_VERSION}")
 endif()
 
 # Get PostgreSQL configuration from pg_config
@@ -420,10 +441,7 @@ endif()
 if(NOT CLANG_FORMAT)
   find_program(DOCKER docker DOC "The path to docker")
 
-  if(NOT DOCKER)
-    message(
-      WARNING "clang-format is disabled (can't find clang-format or docker)")
-  else()
+  if(DOCKER)
     message(STATUS "Using docker based clang-format")
     add_custom_target(
       clang-format
@@ -462,6 +480,29 @@ if(TARGET clang-format OR TARGET cmake-format)
   endif()
 endif()
 
+if(REGRESS_CHECKS)
+  find_program(PG_REGRESS pg_regress
+               HINTS "${PG_BINDIR}" "${PG_PKGLIBDIR}/pgxs/src/test/regress/")
+
+  if(NOT PG_REGRESS)
+    message(STATUS "Regress checks disabled: program 'pg_regress' not found")
+  endif()
+
+  find_program(
+    PG_ISOLATION_REGRESS
+    NAMES pg_isolation_regress
+    HINTS ${PG_BINDIR} ${PG_PKGLIBDIR}/pgxs/src/test/isolation
+          ${PG_SOURCE_DIR}/src/test/isolation ${BINDIR})
+
+  if(NOT PG_ISOLATION_REGRESS)
+    message(
+      STATUS
+        "Isolation regress checks disabled: 'pg_isolation_regress' not found")
+  endif()
+else()
+  message(STATUS "Regress checks and isolation checks disabled")
+endif()
+
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|AppleClang")
   set(LINTER_DEFAULT ON)
 else()
@@ -472,6 +513,9 @@ endif()
 option(LINTER "Enable linter support using clang-tidy (ON when using clang)"
        ${LINTER_DEFAULT})
 
+set(LINTER_STRICT_DEFAULT OFF)
+option(LINTER_STRICT "Treat linter warnings as errors" ${LINTER_STRICT_DEFAULT})
+
 if(LINTER)
   find_program(
     CLANG_TIDY clang-tidy
@@ -481,27 +525,17 @@ if(LINTER)
 
   if(CLANG_TIDY)
     message(STATUS "Linter support (clang-tidy) enabled")
-    set(CMAKE_C_CLANG_TIDY "${CLANG_TIDY};--quiet")
+    if(LINTER_STRICT)
+      set(CMAKE_C_CLANG_TIDY
+          "${CLANG_TIDY};--warnings-as-errors=clang-diagnostic-*,clang-analyzer-*,-*,clang-analyzer-core.*,clang-diagnostic-*"
+      )
+    else()
+      set(CMAKE_C_CLANG_TIDY "${CLANG_TIDY};--quiet")
+    endif(LINTER_STRICT)
   else()
     message(STATUS "Install clang-tidy to enable code linting")
   endif(CLANG_TIDY)
 endif(LINTER)
-
-option(USE_OPENSSL "Enable use of OpenSSL if available" ON)
-option(SEND_TELEMETRY_DEFAULT "The default value for whether to send telemetry"
-       ON)
-option(REGRESS_CHECKS "PostgreSQL regress checks through installcheck" ON)
-option(
-  ENABLE_OPTIMIZER_DEBUG
-  "Enable OPTIMIZER_DEBUG when building. Requires Postgres server to be built with OPTIMIZER_DEBUG."
-  OFF)
-
-# Option to enable assertions. Note that if we include headers from a PostgreSQL
-# build that has assertions enabled, we might inherit that setting without
-# explicitly enabling assertions via the ASSERTIONS option defined here. Thus,
-# this option is mostly useful to enable assertions when the PostgreSQL we
-# compile against has it disabled.
-option(ASSERTIONS "Compile with assertion checks (default OFF)" OFF)
 
 if(NOT EXISTS ${PG_INCLUDEDIR}/pg_config.h)
   message(
@@ -517,8 +551,9 @@ string(REGEX MATCH "#define USE_ASSERT_CHECKING 1" PG_USE_ASSERT_CHECKING
 
 if(PG_USE_ASSERT_CHECKING AND NOT ASSERTIONS)
   message(
-    "Assertion checks are OFF although enabled in PostgreSQL build (pg_config.h). "
-    "The PostgreSQL setting for assertions will take precedence.")
+    STATUS
+      "Assertion checks are OFF although enabled in PostgreSQL build (pg_config.h). "
+      "The PostgreSQL setting for assertions will take precedence.")
 elseif(ASSERTIONS)
   message(STATUS "Assertion checks are ON")
   add_compile_definitions(USE_ASSERT_CHECKING=1)
@@ -538,7 +573,8 @@ execute_process(
   COMMAND ${PG_CONFIG} --configure
   OUTPUT_VARIABLE PG_CONFIGURE_FLAGS
   OUTPUT_STRIP_TRAILING_WHITESPACE)
-string(REGEX MATCH "--with-openssl" PG_USE_OPENSSL "${PG_CONFIGURE_FLAGS}")
+string(REGEX MATCH "--with-(ssl=)?openssl" PG_USE_OPENSSL
+             "${PG_CONFIGURE_FLAGS}")
 
 if(USE_OPENSSL AND (NOT PG_USE_OPENSSL))
   message(
@@ -573,7 +609,6 @@ if(USE_OPENSSL)
     endforeach()
     set(OPENSSL_LIBRARIES ${_libraries})
   endif()
-  message(STATUS "OPENSSL_LIBRARIES: ${OPENSSL_LIBRARIES}")
   message(STATUS "Using OpenSSL version ${OPENSSL_VERSION}")
 endif(USE_OPENSSL)
 
@@ -601,10 +636,8 @@ if(TAP_CHECKS)
       PATHS "/usr/bin")
 
     if(NOT PROVE)
-      message(
-        FATAL_ERROR
-          "The prove binary was not found. Disable TAP tests with -DTAP_CHECKS=OFF."
-      )
+      message(STATUS "Not running TAP tests: 'prove' binary not found.")
+      set(TAP_CHECKS OFF)
     endif()
 
     # Check for the IPC::Run module
@@ -614,18 +647,14 @@ if(TAP_CHECKS)
       RESULT_VARIABLE PERL_MODULE_STATUS)
 
     if(PERL_MODULE_STATUS)
-      message(
-        FATAL_ERROR
-          "IPC::Run Perl module not found. Disable TAP tests with -DTAP_CHECKS=OFF."
-      )
+      message(STATUS "Not running TAP tests: IPC::Run Perl module not found.")
+      set(TAP_CHECKS OFF)
     endif()
   else()
-    message(
-      FATAL_ERROR
-        "Perl not found. Disable TAP tests with -DTAP_CHECKS=OFF or set -DPERL_EXECUTABLE=<path/to/perl>. Requires Perl 5.8 or greater (http://perlbrew.pl)."
-    )
+    message(STATUS "Not running TAP tests: Perl not found.")
+    set(TAP_CHECKS OFF)
   endif()
-endif(TAP_CHECKS)
+endif()
 
 if(UNIX)
   add_subdirectory(scripts)

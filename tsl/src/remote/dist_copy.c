@@ -14,7 +14,7 @@
 #include <utils/builtins.h>
 #include <utils/lsyscache.h>
 
-#include "compat.h"
+#include "compat/compat.h"
 #include "dist_copy.h"
 #include "copy.h"
 #include "nodes/chunk_dispatch.h"
@@ -23,7 +23,7 @@
 #include "hypertable.h"
 #include "partitioning.h"
 #include "chunk.h"
-#include "chunk_data_node.h"
+#include "ts_catalog/chunk_data_node.h"
 #include "guc.h"
 #include "remote/connection_cache.h"
 #include "remote/dist_txn.h"
@@ -407,8 +407,8 @@ is_supported_binary_option(const char *option)
 		   strcmp(option, "encoding") == 0;
 }
 
-/* Generate a COPY sql command for sending the data being passed in via 'stmt' to a backend data
- * node.
+/* Generate a COPY sql command for sending the data being passed in via 'stmt'
+ * to a data node.
  */
 static const char *
 deparse_copy_cmd(const CopyStmt *stmt, const Hypertable *ht, bool binary)
@@ -487,11 +487,11 @@ deparse_copy_cmd(const CopyStmt *stmt, const Hypertable *ht, bool binary)
  * This function checks the options specified for the copy command and makes
  * sure they're supported.  It also determines what delimiter and null
  * encoding are being specified and will use these values when sending data to
- * the backend as they presumably won't conflict with the values being passed.
+ * the data node as they presumably won't conflict with the values being passed.
  * Note that the CopyBegin call will have such validation as checking for
  * duplicate options, this function just checks added constraints for the
  * distributed copy. This call is only needed when sending data in text format
- * to the data backend.
+ * to the data node.
  */
 static void
 validate_options(List *copy_options, char *delimiter, char **null_string)
@@ -631,7 +631,7 @@ remote_copy_get_copycmd(RemoteCopyContext *context)
 }
 
 static StringInfo
-parse_next_text_row(CopyState cstate, List *attnums, TextCopyContext *ctx)
+parse_next_text_row(CopyFromState cstate, List *attnums, TextCopyContext *ctx)
 {
 	StringInfo row_data = makeStringInfo();
 	int i;
@@ -693,7 +693,7 @@ generate_binary_copy_data(Datum *values, bool *nulls, List *attnums, FmgrInfo *o
 }
 
 static StringInfo
-parse_next_binary_row(CopyState cstate, List *attnums, BinaryCopyContext *ctx)
+parse_next_binary_row(CopyFromState cstate, List *attnums, BinaryCopyContext *ctx)
 {
 	if (!NextCopyFrom(cstate, ctx->econtext, ctx->values, ctx->nulls))
 		return NULL;
@@ -702,7 +702,7 @@ parse_next_binary_row(CopyState cstate, List *attnums, BinaryCopyContext *ctx)
 }
 
 static bool
-read_next_copy_row(RemoteCopyContext *context, CopyState cstate)
+read_next_copy_row(RemoteCopyContext *context, CopyFromState cstate)
 {
 	if (context->binary_operation)
 		context->row_data = parse_next_binary_row(cstate, context->attnums, context->data_context);
@@ -768,8 +768,8 @@ get_target_chunk(Hypertable *ht, Point *p, CopyConnectionState *state)
 	if (chunk == NULL)
 	{
 		/* Here we need to create a new chunk.  However, any in-progress copy operations
-		 * will be tying up the connection we need to create the chunk on a backend.  Since
-		 * the backends for the new chunk aren't yet known, just close all in progress COPYs
+		 * will be tying up the connection we need to create the chunk on a data node.  Since
+		 * the data nodes for the new chunk aren't yet known, just close all in progress COPYs
 		 * before creating the chunk. */
 		reset_copy_connection_state(state);
 		chunk = ts_hypertable_get_or_create_chunk(ht, p);

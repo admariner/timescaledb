@@ -30,16 +30,15 @@
 #include <tcop/tcopprot.h>
 #include <nodes/pg_list.h>
 
+#include "compat/compat.h"
 #include "extension.h"
 #include "guc.h"
-#include "scheduler.h"
 #include "job.h"
 #include "job_stat.h"
-#include "version.h"
-#include "compat.h"
-#include "timer.h"
 #include "launcher_interface.h"
-#include "compat.h"
+#include "scheduler.h"
+#include "timer.h"
+#include "version.h"
 
 #define SCHEDULER_APPNAME "TimescaleDB Background Worker Scheduler"
 #define START_RETRY_MS (1 * INT64CONST(1000)) /* 1 seconds */
@@ -140,7 +139,7 @@ ts_bgw_start_worker(const char *function, const char *name, const char *extra)
 	return handle;
 }
 
-#if USE_ASSERT_CHECKING
+#ifdef USE_ASSERT_CHECKING
 static void
 assert_that_worker_has_stopped(ScheduledBgwJob *sjob)
 {
@@ -178,7 +177,7 @@ worker_state_cleanup(ScheduledBgwJob *sjob)
 	 */
 	if (sjob->handle != NULL)
 	{
-#if USE_ASSERT_CHECKING
+#ifdef USE_ASSERT_CHECKING
 		/* Sanity check: worker has stopped (if it was started) */
 		assert_that_worker_has_stopped(sjob);
 #endif
@@ -240,7 +239,7 @@ worker_state_cleanup(ScheduledBgwJob *sjob)
 static void
 scheduled_bgw_job_transition_state_to(ScheduledBgwJob *sjob, JobState new_state)
 {
-#if USE_ASSERT_CHECKING
+#ifdef USE_ASSERT_CHECKING
 	JobState prev_state = sjob->state;
 #endif
 

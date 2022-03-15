@@ -16,8 +16,8 @@
 #include <miscadmin.h>
 #include <nodes/makefuncs.h>
 
-#include "catalog.h"
-#include "compat.h"
+#include "ts_catalog/catalog.h"
+#include "compat/compat.h"
 #include "cross_module_fn.h"
 #include "dimension.h"
 #include "dimension_slice.h"
@@ -1078,7 +1078,9 @@ dimension_add_not_null_on_column(Oid table_relid, char *colname)
 			(errmsg("adding not-null constraint to column \"%s\"", colname),
 			 errdetail("Time dimensions cannot have NULL values.")));
 
+	EventTriggerAlterTableStart((Node *) &cmd);
 	AlterTableInternal(table_relid, list_make1(&cmd), false);
+	EventTriggerAlterTableEnd();
 }
 
 void

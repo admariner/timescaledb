@@ -7,7 +7,7 @@
 
 #include <access/xact.h>
 #include <access/heapam.h>
-#include "../compat-msvc-enter.h"
+#include "../compat/compat-msvc-enter.h"
 #include <postmaster/bgworker.h>
 #include <commands/extension.h>
 #include <commands/user.h>
@@ -15,7 +15,7 @@
 #include <parser/analyze.h>
 #include <storage/ipc.h>
 #include <tcop/utility.h>
-#include "../compat-msvc-exit.h"
+#include "../compat/compat-msvc-exit.h"
 #include <utils/guc.h>
 #include <utils/inval.h>
 #include <nodes/print.h>
@@ -26,7 +26,7 @@
 #include "extension_utils.c"
 #include "config.h"
 #include "export.h"
-#include "compat.h"
+#include "compat/compat.h"
 #include "extension_constants.h"
 
 #include "loader/loader.h"
@@ -59,17 +59,22 @@
  * Some notes on design:
  *
  * We do not check for the installation of the extension upon loading the extension and instead rely
- *on a hook for two reasons: 1) We probably can't
- *	- The shared_preload_libraries is called in PostmasterMain which is way before InitPostgres is
- *called. (Note: This happens even before the fork of the backend) -- so we don't even know which
- *database this is for.
- *	-- This means we cannot query for the existence of the extension yet because the caches are
- *initialized in InitPostgres. 2) We actually don't want to load the extension in two cases: a) We
- *are upgrading the extension. b) We set the guc timescaledb.disable_load.
+ * on a hook for a few reasons:
+ *
+ * 1) We probably can't:
+ *    - The shared_preload_libraries is called in PostmasterMain which is way before InitPostgres is
+ *      called. Note: This happens even before the fork of the backend, so we don't even know which
+ *      database this is for.
+ *    - This means we cannot query for the existence of the extension yet because the caches are
+ *      initialized in InitPostgres.
+ *
+ * 2) We actually don't want to load the extension in two cases:
+ *    a) We are upgrading the extension.
+ *    b) We set the guc timescaledb.disable_load.
  *
  * 3) We include a section for the bgw launcher and some workers below the rest, separated with its
- *own notes, some function definitions are included as they are referenced by other loader
- *functions.
+ *    own notes, some function definitions are included as they are referenced by other loader
+ *    functions.
  *
  */
 
@@ -111,7 +116,12 @@ static ProcessUtility_hook_type prev_ProcessUtility_hook;
 static post_parse_analyze_hook_type extension_post_parse_analyze_hook = NULL;
 
 static void inline extension_check(void);
+#if PG14_LT
 static void call_extension_post_parse_analyze_hook(ParseState *pstate, Query *query);
+#else
+static void call_extension_post_parse_analyze_hook(ParseState *pstate, Query *query,
+												   JumbleState *jstate);
+#endif
 
 extern char *
 ts_loader_extension_version(void)
@@ -163,7 +173,7 @@ extension_owner(void)
 				Anum_pg_extension_extname,
 				BTEqualStrategyNumber,
 				F_NAMEEQ,
-				DirectFunctionCall1(namein, CStringGetDatum(EXTENSION_NAME)));
+				CStringGetDatum(EXTENSION_NAME));
 
 	scandesc = systable_beginscan(rel, ExtensionNameIndexId, true, NULL, 1, entry);
 
@@ -332,7 +342,11 @@ stop_workers_on_db_drop(DropdbStmt *drop_db_statement)
 }
 
 static void
+#if PG14_LT
 post_analyze_hook(ParseState *pstate, Query *query)
+#else
+post_analyze_hook(ParseState *pstate, Query *query, JumbleState *jstate)
+#endif
 {
 	if (query->commandType == CMD_UTILITY)
 	{
@@ -437,24 +451,71 @@ post_analyze_hook(ParseState *pstate, Query *query)
 		(query->commandType != CMD_UTILITY || load_utility_cmd(query->utilityStmt)))
 		extension_check();
 
-	/*
-	 * Call the extension's hook. This is necessary since the extension is
-	 * installed during the hook. If we did not do this the extension's hook
-	 * would not be called during the first command because the extension
-	 * would not have yet been installed. Thus the loader captures the
-	 * extension hook and calls it explicitly after the check for installing
-	 * the extension.
-	 */
+		/*
+		 * Call the extension's hook. This is necessary since the extension is
+		 * installed during the hook. If we did not do this the extension's hook
+		 * would not be called during the first command because the extension
+		 * would not have yet been installed. Thus the loader captures the
+		 * extension hook and calls it explicitly after the check for installing
+		 * the extension.
+		 */
+#if PG14_LT
 	call_extension_post_parse_analyze_hook(pstate, query);
+#else
+	call_extension_post_parse_analyze_hook(pstate, query, jstate);
+#endif
 
 	if (prev_post_parse_analyze_hook != NULL)
 	{
+#if PG14_LT
 		prev_post_parse_analyze_hook(pstate, query);
+#else
+		prev_post_parse_analyze_hook(pstate, query, jstate);
+#endif
 	}
+}
+
+/*
+ * Check if a string is an UUID and error out otherwise.
+ */
+static void
+check_uuid(const char *label)
+{
+	const MemoryContext oldcontext = CurrentMemoryContext;
+	const char *uuid = strchr(label, SECLABEL_DIST_TAG_SEPARATOR);
+	if (!uuid || strncmp(label, SECLABEL_DIST_TAG, uuid - label) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("TimescaleDB label is for internal use only"),
+				 errdetail("Security label is \"%s\".", label),
+				 errhint("Security label has to be of format \"dist_uuid:<UUID>\".")));
+
+	PG_TRY();
+	{
+		DirectFunctionCall1(uuid_in, CStringGetDatum(&uuid[1]));
+	}
+	PG_CATCH();
+	{
+		ErrorData *edata;
+		MemoryContextSwitchTo(oldcontext);
+		edata = CopyErrorData();
+		if (edata->sqlerrcode == ERRCODE_INVALID_TEXT_REPRESENTATION)
+		{
+			FlushErrorState();
+			edata->detail = edata->message;
+			edata->hint = psprintf("Security label has to be of format \"dist_uuid:<UUID>\".");
+			edata->message = psprintf("TimescaleDB label is for internal use only");
+		}
+		ReThrowError(edata);
+	}
+	PG_END_TRY();
 }
 
 static void
 loader_process_utility_hook(PlannedStmt *pstmt, const char *query_string,
+#if PG14_GE
+							bool readonly_tree,
+#endif
 							ProcessUtilityContext context, ParamListInfo params,
 							QueryEnvironment *queryEnv, DestReceiver *dest,
 #if PG13_GE
@@ -485,8 +546,13 @@ loader_process_utility_hook(PlannedStmt *pstmt, const char *query_string,
 		{
 			SecLabelStmt *stmt = castNode(SecLabelStmt, pstmt->utilityStmt);
 
+			/*
+			 * Since this statement can be in a dump output, we only print an
+			 * error on anything that doesn't looks like a sane distributed
+			 * UUID.
+			 */
 			if (stmt->provider && strcmp(stmt->provider, SECLABEL_DIST_PROVIDER) == 0)
-				ereport(ERROR, (errmsg("TimescaleDB label is for internal use only")));
+				check_uuid(stmt->label);
 			break;
 		}
 		default:
@@ -499,7 +565,16 @@ loader_process_utility_hook(PlannedStmt *pstmt, const char *query_string,
 	else
 		process_utility = standard_ProcessUtility;
 
-	process_utility(pstmt, query_string, context, params, queryEnv, dest, completion_tag);
+	process_utility(pstmt,
+					query_string,
+#if PG14_GE
+					readonly_tree,
+#endif
+					context,
+					params,
+					queryEnv,
+					dest,
+					completion_tag);
 
 	/*
 	 * Show a NOTICE warning message in case of dropping a
@@ -696,10 +771,18 @@ ts_loader_extension_check(void)
 }
 
 static void
+#if PG14_LT
 call_extension_post_parse_analyze_hook(ParseState *pstate, Query *query)
+#else
+call_extension_post_parse_analyze_hook(ParseState *pstate, Query *query, JumbleState *jstate)
+#endif
 {
 	if (loaded && extension_post_parse_analyze_hook != NULL)
 	{
+#if PG14_LT
 		extension_post_parse_analyze_hook(pstate, query);
+#else
+		extension_post_parse_analyze_hook(pstate, query, jstate);
+#endif
 	}
 }

@@ -12,8 +12,10 @@
 #include <nodes/pathnodes.h>
 
 #include "export.h"
+#include "guc.h"
 
-typedef struct TsFdwRelationInfo TsFdwRelationInfo;
+typedef struct Chunk Chunk;
+typedef struct TsFdwRelInfo TsFdwRelInfo;
 typedef struct TimescaleDBPrivate
 {
 	bool appends_ordered;
@@ -24,10 +26,17 @@ typedef struct TimescaleDBPrivate
 	List *chunk_oids;
 	List *serverids;
 	Relids server_relids;
-	TsFdwRelationInfo *fdw_relation_info;
+	TsFdwRelInfo *fdw_relation_info;
+
+	/* Cached chunk data for the chunk relinfo. */
+	Chunk *chunk;
 } TimescaleDBPrivate;
 
 extern TSDLLEXPORT bool ts_rte_is_hypertable(const RangeTblEntry *rte, bool *isdistributed);
+extern TSDLLEXPORT bool ts_rte_is_marked_for_expansion(const RangeTblEntry *rte);
+extern TSDLLEXPORT bool ts_contain_param(Node *node);
+
+extern TSDLLEXPORT DataFetcherType ts_data_node_fetcher_scan_type;
 
 static inline TimescaleDBPrivate *
 ts_create_private_reloptinfo(RelOptInfo *rel)

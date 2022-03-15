@@ -11,22 +11,18 @@
 #include <utils/builtins.h>
 #include <utils/fmgrprotos.h>
 
-#include "catalog.h"
+#include "ts_catalog/catalog.h"
+#include "config.h"
 #include "dist_util.h"
 #include "errors.h"
 #include "funcapi.h"
 #include "loader/seclabel.h"
-#include "metadata.h"
+#include "ts_catalog/metadata.h"
 #include "remote/dist_commands.h"
+#ifdef USE_TELEMETRY
 #include "telemetry/telemetry_metadata.h"
+#endif
 #include "utils/uuid.h"
-
-/*
- * When added to a distributed database, this key in the metadata table will be set to match the
- * uuid (from ts_metadata_get_uuid()) of the frontend.  Therefore we can check if a database is the
- * frontend or not simply by comparing the results of dist_util_get_id() and ts_metadata_get_uuid().
- */
-#define METADATA_DISTRIBUTED_UUID_KEY_NAME "dist_uuid"
 
 static Datum dist_util_remote_srf_query(FunctionCallInfo fcinfo, const char *node_name,
 										const char *sql_query);
@@ -47,10 +43,13 @@ uuid_matches(Datum a, Datum b)
 static Datum
 local_get_dist_id(bool *isnull)
 {
-	return ts_metadata_get_value(CStringGetDatum(METADATA_DISTRIBUTED_UUID_KEY_NAME),
-								 CSTRINGOID,
-								 UUIDOID,
-								 isnull);
+	return ts_metadata_get_value(METADATA_DISTRIBUTED_UUID_KEY_NAME, UUIDOID, isnull);
+}
+
+static Datum
+local_get_uuid(bool *isnull)
+{
+	return ts_metadata_get_value(METADATA_UUID_KEY_NAME, UUIDOID, isnull);
 }
 
 DistUtilMembershipStatus
@@ -61,7 +60,7 @@ dist_util_membership(void)
 
 	if (isnull)
 		return DIST_MEMBER_NONE;
-	else if (uuid_matches(dist_id, ts_telemetry_metadata_get_uuid()))
+	else if (uuid_matches(dist_id, local_get_uuid(&isnull)))
 		return DIST_MEMBER_ACCESS_NODE;
 	else
 		return DIST_MEMBER_DATA_NODE;
@@ -92,9 +91,10 @@ seclabel_set_dist_uuid(Oid dbid, Datum dist_uuid)
 }
 
 void
-dist_util_set_as_frontend()
+dist_util_set_as_access_node()
 {
-	dist_util_set_id_with_uuid_check(ts_telemetry_metadata_get_uuid(), false);
+	bool isnull;
+	dist_util_set_id_with_uuid_check(local_get_uuid(&isnull), false);
 
 	/*
 	 * Set security label to mark current database as the access node database.
@@ -114,6 +114,7 @@ dist_util_set_id(Datum dist_id)
 static bool
 dist_util_set_id_with_uuid_check(Datum dist_id, bool check_uuid)
 {
+	bool isnull;
 	if (dist_util_membership() != DIST_MEMBER_NONE)
 	{
 		if (uuid_matches(dist_id, dist_util_get_id()))
@@ -124,7 +125,8 @@ dist_util_set_id_with_uuid_check(Datum dist_id, bool check_uuid)
 					 (errmsg("database is already a member of a distributed database"))));
 	}
 
-	if (check_uuid && uuid_matches(dist_id, ts_telemetry_metadata_get_uuid()))
+	Datum uuid = local_get_uuid(&isnull);
+	if (check_uuid && !isnull && uuid_matches(dist_id, uuid))
 		ereport(ERROR,
 				(errcode(ERRCODE_TS_DATA_NODE_INVALID_CONFIG),
 				 (errmsg("cannot add the current database as a data node to itself"),
@@ -134,11 +136,7 @@ dist_util_set_id_with_uuid_check(Datum dist_id, bool check_uuid)
 						  "instance or that the 'database' parameter refers to a "
 						  "different database."))));
 
-	ts_metadata_insert(CStringGetDatum(METADATA_DISTRIBUTED_UUID_KEY_NAME),
-					   CSTRINGOID,
-					   dist_id,
-					   UUIDOID,
-					   true);
+	ts_metadata_insert(METADATA_DISTRIBUTED_UUID_KEY_NAME, dist_id, UUIDOID, true);
 	return true;
 }
 
@@ -162,7 +160,7 @@ dist_util_remove_from_db()
 		CatalogSecurityContext sec_ctx;
 
 		ts_catalog_database_info_become_owner(ts_catalog_database_info_get(), &sec_ctx);
-		ts_metadata_drop(CStringGetDatum(METADATA_DISTRIBUTED_UUID_KEY_NAME), CSTRINGOID);
+		ts_metadata_drop(METADATA_DISTRIBUTED_UUID_KEY_NAME);
 		ts_catalog_restore_user(&sec_ctx);
 
 		return true;
@@ -186,7 +184,7 @@ dist_util_set_peer_id(Datum dist_id)
 }
 
 bool
-dist_util_is_frontend_session(void)
+dist_util_is_access_node_session_on_data_node(void)
 {
 	Datum dist_id;
 

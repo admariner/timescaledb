@@ -12,7 +12,7 @@
 #include <nodes/extensible.h>
 #include <executor/nodeModifyTable.h>
 
-#include "compat.h"
+#include "compat/compat.h"
 #include "chunk_dispatch_state.h"
 #include "chunk_dispatch_plan.h"
 #include "chunk_dispatch.h"
@@ -51,11 +51,14 @@ static void
 on_chunk_insert_state_changed(ChunkInsertState *cis, void *data)
 {
 	ChunkDispatchState *state = data;
+#if PG14_LT
 	ModifyTableState *mtstate = state->mtstate;
 
-	/* PG12 expects the current target slot to match the result relation. Thus
+	/* PG < 14 expects the current target slot to match the result relation. Thus
 	 * we need to make sure it is up-to-date with the current chunk here. */
 	mtstate->mt_scans[mtstate->mt_whichplan] = cis->slot;
+#endif
+	state->rri = cis->result_relation_info;
 }
 
 static TupleTableSlot *
@@ -87,11 +90,15 @@ chunk_dispatch_exec(CustomScanState *node)
 	point = ts_hyperspace_calculate_point(ht->space, slot);
 
 	/* Save the main table's (hypertable's) ResultRelInfo */
-	if (NULL == dispatch->hypertable_result_rel_info)
+	if (!dispatch->hypertable_result_rel_info)
 	{
+#if PG14_LT
 		Assert(RelationGetRelid(estate->es_result_relation_info->ri_RelationDesc) ==
 			   state->hypertable_relid);
 		dispatch->hypertable_result_rel_info = estate->es_result_relation_info;
+#else
+		dispatch->hypertable_result_rel_info = dispatch->dispatch_state->mtstate->resultRelInfo;
+#endif
 	}
 
 	/* Find or create the insert state matching the point */
@@ -103,14 +110,16 @@ chunk_dispatch_exec(CustomScanState *node)
 	/*
 	 * Set the result relation in the executor state to the target chunk.
 	 * This makes sure that the tuple gets inserted into the correct
-	 * chunk. Note that since the ModifyTable executor saves and restores
+	 * chunk. Note that since in PG < 14 the ModifyTable executor saves and restores
 	 * the es_result_relation_info this has to be updated every time, not
 	 * just when the chunk changes.
 	 */
-	if (cis->compress_state != NULL)
-		estate->es_result_relation_info = cis->orig_result_relation_info;
+#if PG14_LT
+	if (cis->compress_info != NULL)
+		estate->es_result_relation_info = cis->compress_info->orig_result_relation_info;
 	else
 		estate->es_result_relation_info = cis->result_relation_info;
+#endif
 
 	MemoryContextSwitchTo(old);
 
@@ -118,32 +127,54 @@ chunk_dispatch_exec(CustomScanState *node)
 	if (cis->hyper_to_chunk_map != NULL)
 		slot = execute_attr_map_slot(cis->hyper_to_chunk_map->attrMap, slot, cis->slot);
 
-	if (cis->compress_state != NULL)
+	if (cis->compress_info != NULL)
 	{
 		/*
 		 * When the chunk is compressed, we redirect the insert to the internal compressed
 		 * chunk. However, any BEFORE ROW triggers defined on the chunk have to be executed
 		 * before we redirect the insert.
 		 */
-		if (cis->orig_result_relation_info->ri_TrigDesc &&
-			cis->orig_result_relation_info->ri_TrigDesc->trig_insert_before_row)
+		if (cis->compress_info->orig_result_relation_info->ri_TrigDesc &&
+			cis->compress_info->orig_result_relation_info->ri_TrigDesc->trig_insert_before_row)
 		{
 			bool skip_tuple;
-			skip_tuple = !ExecBRInsertTriggers(estate, cis->orig_result_relation_info, slot);
+			skip_tuple =
+				!ExecBRInsertTriggers(estate, cis->compress_info->orig_result_relation_info, slot);
 
 			if (skip_tuple)
 				return NULL;
 		}
 
 		if (cis->rel->rd_att->constr && cis->rel->rd_att->constr->has_generated_stored)
-			ExecComputeStoredGeneratedCompat(estate, slot, CMD_INSERT);
+			ExecComputeStoredGeneratedCompat(cis->compress_info->orig_result_relation_info,
+											 estate,
+											 slot,
+											 CMD_INSERT);
 
 		if (cis->rel->rd_att->constr)
-			ExecConstraints(cis->orig_result_relation_info, slot, estate);
+			ExecConstraints(cis->compress_info->orig_result_relation_info, slot, estate);
 
+#if PG14_LT
 		estate->es_result_relation_info = cis->result_relation_info;
+#endif
 		Assert(ts_cm_functions->compress_row_exec != NULL);
-		slot = ts_cm_functions->compress_row_exec(cis->compress_state, slot);
+		TupleTableSlot *orig_slot = slot;
+		slot = ts_cm_functions->compress_row_exec(cis->compress_info->compress_state, slot);
+		/* If we have cagg defined on the hypertable, we have to execute
+		 * the function that records invalidations directly as AFTER ROW
+		 * triggers do not work with compressed chunks.
+		 */
+		if (cis->compress_info->has_cagg_trigger)
+		{
+			Assert(ts_cm_functions->continuous_agg_call_invalidation_trigger);
+			HeapTupleTableSlot *hslot = (HeapTupleTableSlot *) orig_slot;
+			if (!hslot->tuple)
+				hslot->tuple = heap_form_tuple(orig_slot->tts_tupleDescriptor,
+											   orig_slot->tts_values,
+											   orig_slot->tts_isnull);
+
+			ts_compress_chunk_invoke_cagg_trigger(cis->compress_info, cis->rel, hslot->tuple);
+		}
 	}
 	return slot;
 }
@@ -179,7 +210,7 @@ static CustomExecMethods chunk_dispatch_state_methods = {
  * Check whether the PlanState is a ChunkDispatchState node.
  */
 bool
-ts_chunk_dispatch_is_state(PlanState *state)
+ts_is_chunk_dispatch_state(PlanState *state)
 {
 	CustomScanState *csstate = (CustomScanState *) state;
 
@@ -216,7 +247,9 @@ ts_chunk_dispatch_state_set_parent(ChunkDispatchState *state, ModifyTableState *
 	ModifyTable *mt_plan = castNode(ModifyTable, mtstate->ps.plan);
 
 	/* Inserts on hypertables should always have one subplan */
+#if PG14_LT
 	Assert(mtstate->mt_nplans == 1);
+#endif
 	state->mtstate = mtstate;
 	state->arbiter_indexes = mt_plan->arbiterIndexes;
 }

@@ -3,7 +3,6 @@ DO $$
 DECLARE
  vname regclass;
  materialized_only bool;
- altercmd text;
  ts_version TEXT;
 BEGIN
     SELECT extversion INTO ts_version FROM pg_extension WHERE extname = 'timescaledb';
@@ -18,12 +17,10 @@ BEGIN
         -- to have something more generic, but right now it is just
         -- this case.
         IF ts_version < '2.0.0' THEN
-            altercmd := format('ALTER VIEW %s SET (timescaledb.materialized_only=%L) ', vname::text, materialized_only);
+            EXECUTE format('ALTER VIEW %s SET (timescaledb.materialized_only=%L) ', vname::text, materialized_only);
         ELSE
-            altercmd := format('ALTER MATERIALIZED VIEW %s SET (timescaledb.materialized_only=%L) ', vname::text, materialized_only);
+            EXECUTE format('ALTER MATERIALIZED VIEW %s SET (timescaledb.materialized_only=%L) ', vname::text, materialized_only);
         END IF;
-        RAISE INFO 'cmd executed: %', altercmd;
-        EXECUTE altercmd;
     END LOOP;
     EXCEPTION WHEN OTHERS THEN RAISE;
 END
@@ -40,12 +37,12 @@ DROP FUNCTION IF EXISTS _timescaledb_internal.cagg_watermark(oid);
 -- in the first version of TimescaleDB and should have the correct
 -- initprivs, but we could use any other table that existed in the
 -- first installation.
-INSERT INTO saved_privs
+INSERT INTO _timescaledb_internal.saved_privs
      SELECT nspname, relname, relacl,
-       (SELECT tmpini FROM saved_privs
+       (SELECT tmpini FROM _timescaledb_internal.saved_privs
         WHERE tmpnsp = '_timescaledb_catalog' AND tmpname = 'chunk')
        FROM pg_class JOIN pg_namespace ns ON ns.oid = relnamespace
-         LEFT JOIN saved_privs ON tmpnsp = nspname AND tmpname = relname
+         LEFT JOIN _timescaledb_internal.saved_privs ON tmpnsp = nspname AND tmpname = relname
       WHERE relkind IN ('r', 'v') AND nspname IN ('_timescaledb_catalog', '_timescaledb_config')
         OR nspname = '_timescaledb_internal'
         AND relname IN ('hypertable_chunk_local_size', 'compressed_chunk_stats',
@@ -54,12 +51,12 @@ ON CONFLICT DO NOTHING;
 
 -- The above is good enough for tables and views. However sequences need to
 -- use the "chunk_id_seq" catalog sequence as a template
-INSERT INTO saved_privs
+INSERT INTO _timescaledb_internal.saved_privs
      SELECT nspname, relname, relacl,
-        (SELECT tmpini FROM saved_privs
+        (SELECT tmpini FROM _timescaledb_internal.saved_privs
 	     WHERE tmpnsp = '_timescaledb_catalog' AND tmpname = 'chunk_id_seq')
         FROM pg_class JOIN pg_namespace ns ON ns.oid = relnamespace
-		    LEFT JOIN saved_privs ON tmpnsp = nspname AND tmpname = relname
+		    LEFT JOIN _timescaledb_internal.saved_privs ON tmpnsp = nspname AND tmpname = relname
       WHERE relkind IN ('S') AND nspname IN ('_timescaledb_catalog', '_timescaledb_config')
         OR nspname = '_timescaledb_internal'
         AND relname IN ('hypertable_chunk_local_size', 'compressed_chunk_stats',
@@ -71,7 +68,7 @@ WITH to_update AS (
      SELECT objoid, tmpini
      FROM pg_class cl JOIN pg_namespace ns ON ns.oid = relnamespace
         JOIN pg_init_privs ip ON ip.objoid = cl.oid AND ip.objsubid = 0
-        JOIN saved_privs ON tmpnsp = nspname AND tmpname = relname)
+        JOIN _timescaledb_internal.saved_privs ON tmpnsp = nspname AND tmpname = relname)
 UPDATE pg_init_privs
    SET initprivs = tmpini
   FROM to_update
@@ -84,8 +81,8 @@ UPDATE pg_init_privs
 WITH to_update AS (
      SELECT cl.oid, tmpacl
      FROM pg_class cl JOIN pg_namespace ns ON ns.oid = relnamespace
-                      JOIN saved_privs ON tmpnsp = nspname AND tmpname = relname)
+                      JOIN _timescaledb_internal.saved_privs ON tmpnsp = nspname AND tmpname = relname)
 UPDATE pg_class cl SET relacl = tmpacl
   FROM to_update WHERE cl.oid = to_update.oid;
 
-DROP TABLE saved_privs;
+DROP TABLE _timescaledb_internal.saved_privs;

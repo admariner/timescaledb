@@ -13,11 +13,12 @@
 #include <utils/json.h>
 #include <utils/jsonb.h>
 
-#include "compat.h"
+#include "compat/compat.h"
 #include "config.h"
 #include "version.h"
 #include "guc.h"
 #include "telemetry.h"
+#include "ts_catalog/metadata.h"
 #include "telemetry_metadata.h"
 #include "hypertable.h"
 #include "extension.h"
@@ -25,17 +26,19 @@
 #include "jsonb_utils.h"
 #include "license_guc.h"
 #include "bgw_policy/policy.h"
-#include "compression_chunk_size.h"
+#include "ts_catalog/compression_chunk_size.h"
+#include "stats.h"
 
 #include "cross_module_fn.h"
 
+#define TS_TELEMETRY_VERSION 2
 #define TS_VERSION_JSON_FIELD "current_timescaledb_version"
 #define TS_IS_UPTODATE_JSON_FIELD "is_up_to_date"
 
 /*  HTTP request details */
-#define TIMESCALE_TYPE "application/json"
 #define MAX_REQUEST_SIZE 4096
 
+#define REQ_TELEMETRY_VERSION "telemetry_version"
 #define REQ_DB_UUID "db_uuid"
 #define REQ_EXPORTED_DB_UUID "exported_db_uuid"
 #define REQ_INSTALL_TIME "installed_time"
@@ -51,9 +54,7 @@
 #define REQ_BUILD_ARCHITECTURE_BIT_SIZE "build_architecture_bit_size"
 #define REQ_BUILD_ARCHITECTURE "build_architecture"
 #define REQ_DATA_VOLUME "data_volume"
-#define REQ_NUM_HYPERTABLES "num_hypertables"
-#define REQ_NUM_COMPRESSED_HYPERTABLES "num_compressed_hypertables"
-#define REQ_NUM_CONTINUOUS_AGGS "num_continuous_aggs"
+
 #define REQ_NUM_POLICY_CAGG "num_continuous_aggs_policies"
 #define REQ_NUM_POLICY_COMPRESSION "num_compression_policies"
 #define REQ_NUM_POLICY_REORDER "num_reorder_policies"
@@ -72,22 +73,45 @@
 #define PROMSCALE "promscale"
 #define POSTGIS "postgis"
 #define TIMESCALE_ANALYTICS "timescale_analytics"
-
-#define REQ_COMPRESSED_HEAP_SIZE "compressed_heap_size"
-#define REQ_COMPRESSED_INDEX_SIZE "compressed_index_size"
-#define REQ_COMPRESSED_TOAST_SIZE "compressed_toast_size"
-#define REQ_UNCOMPRESSED_HEAP_SIZE "uncompressed_heap_size"
-#define REQ_UNCOMPRESSED_INDEX_SIZE "uncompressed_index_size"
-#define REQ_UNCOMPRESSED_TOAST_SIZE "uncompressed_toast_size"
-
-#define TS_TELEMETRY_REPORT_OVERRIDE_ARG "always_display_report := true"
+#define TIMESCALEDB_TOOLKIT "timescaledb_toolkit"
 
 static const char *related_extensions[] = {
-	PG_PROMETHEUS,
-	PROMSCALE,
-	POSTGIS,
-	TIMESCALE_ANALYTICS,
+	PG_PROMETHEUS, PROMSCALE, POSTGIS, TIMESCALE_ANALYTICS, TIMESCALEDB_TOOLKIT,
 };
+
+/* This function counts background worker jobs by type. */
+static BgwJobTypeCount
+bgw_job_type_counts()
+{
+	ListCell *lc;
+	List *jobs = ts_bgw_job_get_all(sizeof(BgwJob), CurrentMemoryContext);
+	BgwJobTypeCount counts = { 0 };
+
+	foreach (lc, jobs)
+	{
+		BgwJob *job = lfirst(lc);
+
+		if (namestrcmp(&job->fd.proc_schema, INTERNAL_SCHEMA_NAME) == 0)
+		{
+			if (namestrcmp(&job->fd.proc_name, "policy_refresh_continuous_aggregate") == 0)
+				counts.policy_cagg++;
+			else if (namestrcmp(&job->fd.proc_name, "policy_compression") == 0)
+				counts.policy_compression++;
+			else if (namestrcmp(&job->fd.proc_name, "policy_reorder") == 0)
+				counts.policy_reorder++;
+			else if (namestrcmp(&job->fd.proc_name, "policy_retention") == 0)
+				counts.policy_retention++;
+			else if (namestrcmp(&job->fd.proc_name, "policy_telemetry") == 0)
+				counts.policy_telemetry++;
+		}
+		else
+		{
+			counts.user_defined_action++;
+		}
+	}
+
+	return counts;
+}
 
 static bool
 char_in_valid_version_digits(const char c)
@@ -183,63 +207,16 @@ ts_check_version_response(const char *json)
 	}
 }
 
-static char *
-get_size(int64 size)
-{
-	StringInfo buf = makeStringInfo();
-
-	appendStringInfo(buf, INT64_FORMAT, size);
-	return buf->data;
-}
-
-static char *
-get_num_hypertables()
-{
-	HypertablesStat stat;
-	StringInfo buf = makeStringInfo();
-
-	memset(&stat, 0, sizeof(stat));
-	ts_number_of_hypertables(&stat);
-
-	appendStringInfo(buf, "%d", stat.num_hypertables_user);
-	return buf->data;
-}
-
-static char *
-get_num_compressed_hypertables()
-{
-	HypertablesStat stat;
-	StringInfo buf = makeStringInfo();
-
-	memset(&stat, 0, sizeof(stat));
-	ts_number_of_hypertables(&stat);
-
-	appendStringInfo(buf, "%d", stat.num_hypertables_compressed);
-	return buf->data;
-}
-
-static char *
+static int32
 get_architecture_bit_size()
 {
-	StringInfo buf = makeStringInfo();
-
-	appendStringInfo(buf, "%d", BUILD_POINTER_BYTES * 8);
-	return buf->data;
-}
-
-static char *
-get_num_continuous_aggs()
-{
-	StringInfo buf = makeStringInfo();
-
-	appendStringInfo(buf, "%d", ts_number_of_continuous_aggs());
-	return buf->data;
+	return BUILD_POINTER_BYTES * 8;
 }
 
 static void
 add_job_counts(JsonbParseState *state)
 {
-	BgwJobTypeCount counts = ts_bgw_job_type_counts();
+	BgwJobTypeCount counts = bgw_job_type_counts();
 
 	ts_jsonb_add_int32(state, REQ_NUM_POLICY_CAGG, counts.policy_cagg);
 	ts_jsonb_add_int32(state, REQ_NUM_POLICY_COMPRESSION, counts.policy_compression);
@@ -248,15 +225,10 @@ add_job_counts(JsonbParseState *state)
 	ts_jsonb_add_int32(state, REQ_NUM_USER_DEFINED_ACTIONS, counts.user_defined_action);
 }
 
-static char *
+static int64
 get_database_size()
 {
-	StringInfo buf = makeStringInfo();
-	int64 data_size =
-		DatumGetInt64(DirectFunctionCall1(pg_database_size_oid, ObjectIdGetDatum(MyDatabaseId)));
-
-	appendStringInfo(buf, "" INT64_FORMAT "", data_size);
-	return buf->data;
+	return DatumGetInt64(DirectFunctionCall1(pg_database_size_oid, ObjectIdGetDatum(MyDatabaseId)));
 }
 
 static void
@@ -270,7 +242,7 @@ add_related_extensions(JsonbParseState *state)
 	{
 		const char *ext = related_extensions[i];
 
-		ts_jsonb_add_str(state, ext, OidIsValid(get_extension_oid(ext, true)) ? "true" : "false");
+		ts_jsonb_add_bool(state, ext, OidIsValid(get_extension_oid(ext, true)));
 	}
 
 	pushJsonbValue(&state, WJB_END_OBJECT, NULL);
@@ -309,32 +281,160 @@ format_iso8601(Datum value)
 		DirectFunctionCall2(timestamptz_to_char, value, CStringGetTextDatum(ISO8601_FORMAT)));
 }
 
-static StringInfo
-build_version_body(void)
+#define REQ_RELKIND_COUNT "num_relations"
+#define REQ_RELKIND_RELTUPLES "num_reltuples"
+
+#define REQ_RELKIND_HEAP_SIZE "heap_size"
+#define REQ_RELKIND_TOAST_SIZE "toast_size"
+#define REQ_RELKIND_INDEXES_SIZE "indexes_size"
+
+#define REQ_RELKIND_CHILDREN "num_children"
+#define REQ_RELKIND_REPLICA_CHUNKS "num_replica_chunks"
+#define REQ_RELKIND_COMPRESSED_CHUNKS "num_compressed_chunks"
+#define REQ_RELKIND_COMPRESSED_HYPERTABLES "num_compressed_hypertables"
+#define REQ_RELKIND_COMPRESSED_CAGGS "num_compressed_caggs"
+#define REQ_RELKIND_REPLICATED_HYPERTABLES "num_replicated_distributed_hypertables"
+
+#define REQ_RELKIND_UNCOMPRESSED_HEAP_SIZE "uncompressed_heap_size"
+#define REQ_RELKIND_UNCOMPRESSED_TOAST_SIZE "uncompressed_toast_size"
+#define REQ_RELKIND_UNCOMPRESSED_INDEXES_SIZE "uncompressed_indexes_size"
+#define REQ_RELKIND_UNCOMPRESSED_ROWCOUNT "uncompressed_row_count"
+#define REQ_RELKIND_COMPRESSED_HEAP_SIZE "compressed_heap_size"
+#define REQ_RELKIND_COMPRESSED_TOAST_SIZE "compressed_toast_size"
+#define REQ_RELKIND_COMPRESSED_INDEXES_SIZE "compressed_indexes_size"
+#define REQ_RELKIND_COMPRESSED_ROWCOUNT "compressed_row_count"
+
+#define REQ_RELKIND_CAGG_ON_DISTRIBUTED_HYPERTABLE_COUNT "num_caggs_on_distributed_hypertables"
+#define REQ_RELKIND_CAGG_USES_REAL_TIME_AGGREGATION_COUNT "num_caggs_using_real_time_aggregation"
+
+static JsonbValue *
+add_compression_stats_object(JsonbParseState *parse_state, StatsRelType reltype,
+							 const HyperStats *hs)
 {
-	JsonbValue ext_key;
-	JsonbValue license_info_key;
-	JsonbValue *result;
-	Jsonb *jb;
-	StringInfo jtext;
-	VersionOSInfo osinfo;
+	JsonbValue name = {
+		.type = jbvString,
+		.val.string.val = pstrdup("compression"),
+		.val.string.len = strlen("compression"),
+	};
+	pushJsonbValue(&parse_state, WJB_KEY, &name);
+	pushJsonbValue(&parse_state, WJB_BEGIN_OBJECT, NULL);
+
+	ts_jsonb_add_int64(parse_state, REQ_RELKIND_COMPRESSED_CHUNKS, hs->compressed_chunk_count);
+
+	if (reltype == RELTYPE_CONTINUOUS_AGG)
+		ts_jsonb_add_int64(parse_state,
+						   REQ_RELKIND_COMPRESSED_CAGGS,
+						   hs->compressed_hypertable_count);
+	else
+		ts_jsonb_add_int64(parse_state,
+						   REQ_RELKIND_COMPRESSED_HYPERTABLES,
+						   hs->compressed_hypertable_count);
+
+	ts_jsonb_add_int64(parse_state, REQ_RELKIND_COMPRESSED_ROWCOUNT, hs->compressed_row_count);
+	ts_jsonb_add_int64(parse_state, REQ_RELKIND_COMPRESSED_HEAP_SIZE, hs->compressed_heap_size);
+	ts_jsonb_add_int64(parse_state, REQ_RELKIND_COMPRESSED_TOAST_SIZE, hs->compressed_toast_size);
+	ts_jsonb_add_int64(parse_state,
+					   REQ_RELKIND_COMPRESSED_INDEXES_SIZE,
+					   hs->compressed_indexes_size);
+	ts_jsonb_add_int64(parse_state, REQ_RELKIND_UNCOMPRESSED_ROWCOUNT, hs->uncompressed_row_count);
+	ts_jsonb_add_int64(parse_state, REQ_RELKIND_UNCOMPRESSED_HEAP_SIZE, hs->uncompressed_heap_size);
+	ts_jsonb_add_int64(parse_state,
+					   REQ_RELKIND_UNCOMPRESSED_TOAST_SIZE,
+					   hs->uncompressed_toast_size);
+	ts_jsonb_add_int64(parse_state,
+					   REQ_RELKIND_UNCOMPRESSED_INDEXES_SIZE,
+					   hs->uncompressed_indexes_size);
+
+	return pushJsonbValue(&parse_state, WJB_END_OBJECT, NULL);
+}
+
+static JsonbValue *
+add_relkind_stats_object(JsonbParseState *parse_state, const char *relkindname,
+						 const BaseStats *stats, StatsRelType reltype, StatsType statstype)
+{
+	JsonbValue name = {
+		.type = jbvString,
+		.val.string.val = pstrdup(relkindname),
+		.val.string.len = strlen(relkindname),
+	};
+	pushJsonbValue(&parse_state, WJB_KEY, &name);
+	pushJsonbValue(&parse_state, WJB_BEGIN_OBJECT, NULL);
+
+	ts_jsonb_add_int64(parse_state, REQ_RELKIND_COUNT, stats->relcount);
+
+	if (statstype >= STATS_TYPE_STORAGE)
+	{
+		const StorageStats *ss = (const StorageStats *) stats;
+		ts_jsonb_add_int64(parse_state, REQ_RELKIND_RELTUPLES, stats->reltuples);
+		ts_jsonb_add_int64(parse_state, REQ_RELKIND_HEAP_SIZE, ss->relsize.heap_size);
+		ts_jsonb_add_int64(parse_state, REQ_RELKIND_TOAST_SIZE, ss->relsize.toast_size);
+		ts_jsonb_add_int64(parse_state, REQ_RELKIND_INDEXES_SIZE, ss->relsize.index_size);
+	}
+
+	if (statstype >= STATS_TYPE_HYPER)
+	{
+		const HyperStats *hs = (const HyperStats *) stats;
+		ts_jsonb_add_int64(parse_state, REQ_RELKIND_CHILDREN, hs->child_count);
+
+		if (reltype != RELTYPE_PARTITIONED_TABLE)
+			add_compression_stats_object(parse_state, reltype, hs);
+
+		if (reltype == RELTYPE_DISTRIBUTED_HYPERTABLE)
+		{
+			ts_jsonb_add_int64(parse_state,
+							   REQ_RELKIND_REPLICATED_HYPERTABLES,
+							   hs->replicated_hypertable_count);
+			ts_jsonb_add_int64(parse_state, REQ_RELKIND_REPLICA_CHUNKS, hs->replica_chunk_count);
+		}
+	}
+
+	if (statstype == STATS_TYPE_CAGG)
+	{
+		const CaggStats *cs = (const CaggStats *) stats;
+
+		ts_jsonb_add_int64(parse_state,
+						   REQ_RELKIND_CAGG_ON_DISTRIBUTED_HYPERTABLE_COUNT,
+						   cs->on_distributed_hypertable_count);
+		ts_jsonb_add_int64(parse_state,
+						   REQ_RELKIND_CAGG_USES_REAL_TIME_AGGREGATION_COUNT,
+						   cs->uses_real_time_aggregation_count);
+	}
+
+	return pushJsonbValue(&parse_state, WJB_END_OBJECT, NULL);
+}
+
+#define REQ_RELS "relations"
+#define REQ_RELS_TABLES "tables"
+#define REQ_RELS_PARTITIONED_TABLES "partitioned_tables"
+#define REQ_RELS_MATVIEWS "materialized_views"
+#define REQ_RELS_VIEWS "views"
+#define REQ_RELS_HYPERTABLES "hypertables"
+#define REQ_RELS_DISTRIBUTED_HYPERTABLES_AN "distributed_hypertables_access_node"
+#define REQ_RELS_DISTRIBUTED_HYPERTABLES_DN "distributed_hypertables_data_node"
+#define REQ_RELS_CONTINUOUS_AGGS "continuous_aggregates"
+
+static Jsonb *
+build_telemetry_report()
+{
 	JsonbParseState *parse_state = NULL;
-	TotalSizes sizes = ts_compression_chunk_size_totals();
+	JsonbValue key;
+	JsonbValue *result;
+	TelemetryStats relstats;
+	VersionOSInfo osinfo;
 
 	pushJsonbValue(&parse_state, WJB_BEGIN_OBJECT, NULL);
 
+	ts_jsonb_add_int32(parse_state, REQ_TELEMETRY_VERSION, TS_TELEMETRY_VERSION);
 	ts_jsonb_add_str(parse_state,
 					 REQ_DB_UUID,
-					 DatumGetCString(
-						 DirectFunctionCall1(uuid_out, ts_telemetry_metadata_get_uuid())));
+					 DatumGetCString(DirectFunctionCall1(uuid_out, ts_metadata_get_uuid())));
 	ts_jsonb_add_str(parse_state,
 					 REQ_EXPORTED_DB_UUID,
 					 DatumGetCString(
-						 DirectFunctionCall1(uuid_out, ts_telemetry_metadata_get_exported_uuid())));
+						 DirectFunctionCall1(uuid_out, ts_metadata_get_exported_uuid())));
 	ts_jsonb_add_str(parse_state,
 					 REQ_INSTALL_TIME,
-					 format_iso8601(ts_telemetry_metadata_get_install_timestamp()));
-
+					 format_iso8601(ts_metadata_get_install_timestamp()));
 	ts_jsonb_add_str(parse_state, REQ_INSTALL_METHOD, TIMESCALEDB_INSTALL_METHOD);
 
 	if (ts_version_get_os_info(&osinfo))
@@ -353,39 +453,94 @@ build_version_body(void)
 	ts_jsonb_add_str(parse_state, REQ_BUILD_OS, BUILD_OS_NAME);
 	ts_jsonb_add_str(parse_state, REQ_BUILD_OS_VERSION, BUILD_OS_VERSION);
 	ts_jsonb_add_str(parse_state, REQ_BUILD_ARCHITECTURE, BUILD_PROCESSOR);
-	ts_jsonb_add_str(parse_state, REQ_BUILD_ARCHITECTURE_BIT_SIZE, get_architecture_bit_size());
-	ts_jsonb_add_str(parse_state, REQ_DATA_VOLUME, get_database_size());
-	ts_jsonb_add_str(parse_state, REQ_NUM_HYPERTABLES, get_num_hypertables());
-	ts_jsonb_add_str(parse_state, REQ_NUM_COMPRESSED_HYPERTABLES, get_num_compressed_hypertables());
-	ts_jsonb_add_str(parse_state, REQ_NUM_CONTINUOUS_AGGS, get_num_continuous_aggs());
+	ts_jsonb_add_int32(parse_state, REQ_BUILD_ARCHITECTURE_BIT_SIZE, get_architecture_bit_size());
+	ts_jsonb_add_int64(parse_state, REQ_DATA_VOLUME, get_database_size());
+
+	/* Add relation stats */
+	ts_telemetry_stats_gather(&relstats);
+	key.type = jbvString;
+	key.val.string.val = REQ_RELS;
+	key.val.string.len = strlen(REQ_RELS);
+	pushJsonbValue(&parse_state, WJB_KEY, &key);
+	pushJsonbValue(&parse_state, WJB_BEGIN_OBJECT, NULL);
+
+	add_relkind_stats_object(parse_state,
+							 REQ_RELS_TABLES,
+							 &relstats.tables.base,
+							 RELTYPE_TABLE,
+							 STATS_TYPE_STORAGE);
+	add_relkind_stats_object(parse_state,
+							 REQ_RELS_PARTITIONED_TABLES,
+							 &relstats.partitioned_tables.storage.base,
+							 RELTYPE_PARTITIONED_TABLE,
+							 STATS_TYPE_HYPER);
+	add_relkind_stats_object(parse_state,
+							 REQ_RELS_MATVIEWS,
+							 &relstats.materialized_views.base,
+							 RELTYPE_MATVIEW,
+							 STATS_TYPE_STORAGE);
+	add_relkind_stats_object(parse_state,
+							 REQ_RELS_VIEWS,
+							 &relstats.views,
+							 RELTYPE_VIEW,
+							 STATS_TYPE_BASE);
+	add_relkind_stats_object(parse_state,
+							 REQ_RELS_HYPERTABLES,
+							 &relstats.hypertables.storage.base,
+							 RELTYPE_HYPERTABLE,
+							 STATS_TYPE_HYPER);
+
+	/*
+	 * Distinguish between distributed hypertables on access nodes and the
+	 * "partial" distributed hypertables on data nodes.
+	 *
+	 * Access nodes currently don't store data (chunks), but could potentially
+	 * do it in the future. We only report the data that is actually stored on
+	 * an access node, which currently is zero. One could report the aggregate
+	 * numbers across all data nodes, but that requires using, e.g., a
+	 * function like hypertable_size() that calls out to each data node to get
+	 * its size. However, telemetry probably shouldn't perform such
+	 * distributed calls across data nodes, as it could, e.g., revent the
+	 * access node from reporting telemetry if a data node is down.
+	 *
+	 * It is assumed that data nodes will report telemetry themselves, and the
+	 * size of the data they store will be reported under
+	 * "distributed_hypertables_data_node" to easily distinguish from an
+	 * access node. The aggregate information for the whole distributed
+	 * hypertable could be joined on the server side based on the dist_uuid.
+	 */
+	add_relkind_stats_object(parse_state,
+							 REQ_RELS_DISTRIBUTED_HYPERTABLES_AN,
+							 &relstats.distributed_hypertables.storage.base,
+							 RELTYPE_DISTRIBUTED_HYPERTABLE,
+							 STATS_TYPE_HYPER);
+	add_relkind_stats_object(parse_state,
+							 REQ_RELS_DISTRIBUTED_HYPERTABLES_DN,
+							 &relstats.distributed_hypertable_members.storage.base,
+							 RELTYPE_DISTRIBUTED_HYPERTABLE_MEMBER,
+							 STATS_TYPE_HYPER);
+	add_relkind_stats_object(parse_state,
+							 REQ_RELS_CONTINUOUS_AGGS,
+							 &relstats.continuous_aggs.hyp.storage.base,
+							 RELTYPE_CONTINUOUS_AGG,
+							 STATS_TYPE_CAGG);
+
+	pushJsonbValue(&parse_state, WJB_END_OBJECT, NULL);
 
 	add_job_counts(parse_state);
 
-	ts_jsonb_add_str(parse_state, REQ_COMPRESSED_HEAP_SIZE, get_size(sizes.compressed_heap_size));
-	ts_jsonb_add_str(parse_state, REQ_COMPRESSED_INDEX_SIZE, get_size(sizes.compressed_index_size));
-	ts_jsonb_add_str(parse_state, REQ_COMPRESSED_TOAST_SIZE, get_size(sizes.compressed_toast_size));
-	ts_jsonb_add_str(parse_state,
-					 REQ_UNCOMPRESSED_HEAP_SIZE,
-					 get_size(sizes.uncompressed_heap_size));
-	ts_jsonb_add_str(parse_state,
-					 REQ_UNCOMPRESSED_INDEX_SIZE,
-					 get_size(sizes.uncompressed_index_size));
-	ts_jsonb_add_str(parse_state,
-					 REQ_UNCOMPRESSED_TOAST_SIZE,
-					 get_size(sizes.uncompressed_toast_size));
-
 	/* Add related extensions, which is a nested JSON */
-	ext_key.type = jbvString;
-	ext_key.val.string.val = REQ_RELATED_EXTENSIONS;
-	ext_key.val.string.len = strlen(REQ_RELATED_EXTENSIONS);
-	pushJsonbValue(&parse_state, WJB_KEY, &ext_key);
+	key.type = jbvString;
+	key.val.string.val = REQ_RELATED_EXTENSIONS;
+	key.val.string.len = strlen(REQ_RELATED_EXTENSIONS);
+	pushJsonbValue(&parse_state, WJB_KEY, &key);
 	add_related_extensions(parse_state);
 
 	/* license */
-	license_info_key.type = jbvString;
-	license_info_key.val.string.val = REQ_LICENSE_INFO;
-	license_info_key.val.string.len = strlen(REQ_LICENSE_INFO);
-	pushJsonbValue(&parse_state, WJB_KEY, &license_info_key);
+	key.type = jbvString;
+	key.val.string.val = REQ_LICENSE_INFO;
+	key.val.string.len = strlen(REQ_LICENSE_INFO);
+	pushJsonbValue(&parse_state, WJB_KEY, &key);
 	pushJsonbValue(&parse_state, WJB_BEGIN_OBJECT, NULL);
 	if (ts_license_is_apache())
 		ts_jsonb_add_str(parse_state, REQ_LICENSE_EDITION, REQ_LICENSE_EDITION_APACHE);
@@ -407,10 +562,10 @@ build_version_body(void)
 	/* add cloud to telemetry when set */
 	if (ts_telemetry_cloud != NULL)
 	{
-		ext_key.type = jbvString;
-		ext_key.val.string.val = REQ_INSTANCE_METADATA;
-		ext_key.val.string.len = strlen(REQ_INSTANCE_METADATA);
-		pushJsonbValue(&parse_state, WJB_KEY, &ext_key);
+		key.type = jbvString;
+		key.val.string.val = REQ_INSTANCE_METADATA;
+		key.val.string.len = strlen(REQ_INSTANCE_METADATA);
+		pushJsonbValue(&parse_state, WJB_KEY, &key);
 
 		pushJsonbValue(&parse_state, WJB_BEGIN_OBJECT, NULL);
 		ts_jsonb_add_str(parse_state, REQ_TS_TELEMETRY_CLOUD, ts_telemetry_cloud);
@@ -418,41 +573,32 @@ build_version_body(void)
 	}
 
 	/* Add additional content from metadata */
-	ext_key.type = jbvString;
-	ext_key.val.string.val = REQ_METADATA;
-	ext_key.val.string.len = strlen(REQ_METADATA);
-	pushJsonbValue(&parse_state, WJB_KEY, &ext_key);
+	key.type = jbvString;
+	key.val.string.val = REQ_METADATA;
+	key.val.string.len = strlen(REQ_METADATA);
+	pushJsonbValue(&parse_state, WJB_KEY, &key);
 	pushJsonbValue(&parse_state, WJB_BEGIN_OBJECT, NULL);
 	ts_telemetry_metadata_add_values(parse_state);
 	pushJsonbValue(&parse_state, WJB_END_OBJECT, NULL);
 
 	/* end of telemetry object */
 	result = pushJsonbValue(&parse_state, WJB_END_OBJECT, NULL);
-	jb = JsonbValueToJsonb(result);
-	jtext = makeStringInfo();
-	JsonbToCString(jtext, &jb->root, VARSIZE(jb));
 
-	return jtext;
+	return JsonbValueToJsonb(result);
 }
 
 HttpRequest *
 ts_build_version_request(const char *host, const char *path)
 {
-	char body_len_string[5];
 	HttpRequest *req;
-	StringInfo jtext = build_version_body();
-
-	snprintf(body_len_string, 5, "%d", jtext->len);
+	Jsonb *json = build_telemetry_report();
 
 	/* Fill in HTTP request */
 	req = ts_http_request_create(HTTP_POST);
-
 	ts_http_request_set_uri(req, path);
 	ts_http_request_set_version(req, HTTP_VERSION_10);
-	ts_http_request_set_header(req, HTTP_CONTENT_TYPE, TIMESCALE_TYPE);
-	ts_http_request_set_header(req, HTTP_CONTENT_LENGTH, body_len_string);
 	ts_http_request_set_header(req, HTTP_HOST, host);
-	ts_http_request_set_body(req, jtext->data, jtext->len);
+	ts_http_request_set_body_jsonb(req, json);
 
 	return req;
 }
@@ -583,26 +729,12 @@ cleanup:
 	return false;
 }
 
-TS_FUNCTION_INFO_V1(ts_get_telemetry_report);
+TS_FUNCTION_INFO_V1(ts_telemetry_get_report_jsonb);
 
 Datum
-ts_get_telemetry_report(PG_FUNCTION_ARGS)
+ts_telemetry_get_report_jsonb(PG_FUNCTION_ARGS)
 {
-	StringInfo request;
+	Jsonb *jb = build_telemetry_report();
 
-	/* Show error message if telemetry is disabled and no override argument is passed */
-	if (!ts_telemetry_on())
-	{
-		if (PG_NARGS() == 1 && (PG_ARGISNULL(0) || PG_GETARG_BOOL(0) == false))
-		{
-			elog(INFO,
-				 "Telemetry is disabled. Call get_telemetry_report(%s) to view the report locally.",
-				 TS_TELEMETRY_REPORT_OVERRIDE_ARG);
-			PG_RETURN_NULL();
-		}
-	}
-
-	request = build_version_body();
-
-	return CStringGetTextDatum(request->data);
+	PG_RETURN_JSONB_P(jb);
 }

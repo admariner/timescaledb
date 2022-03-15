@@ -5,6 +5,7 @@
  */
 #include <postgres.h>
 #include <fmgr.h>
+#include <storage/ipc.h>
 
 #include "bgw_policy/compression_api.h"
 #include "bgw_policy/continuous_aggregate_api.h"
@@ -22,6 +23,7 @@
 #include "compression/dictionary.h"
 #include "compression/gorilla.h"
 #include "compression/segment_meta.h"
+#include "config.h"
 #include "continuous_aggs/create.h"
 #include "continuous_aggs/insert.h"
 #include "continuous_aggs/options.h"
@@ -50,7 +52,9 @@
 #include "remote/txn_id.h"
 #include "remote/txn_resolve.h"
 #include "reorder.h"
+#ifdef USE_TELEMETRY
 #include "telemetry.h"
+#endif
 #include "dist_backup.h"
 
 #ifdef PG_MODULE_MAGIC
@@ -81,7 +85,9 @@ cache_syscache_invalidate(Datum arg, int cacheid, uint32 hashvalue)
  * Apache codebase.
  */
 CrossModuleFunctions tsl_cm_functions = {
+#ifdef USE_TELEMETRY
 	.add_tsl_telemetry_info = tsl_telemetry_add_info,
+#endif
 
 	.create_upper_paths_hook = tsl_create_upper_paths_hook,
 	.set_rel_pathlist_dml = tsl_set_rel_pathlist_dml,
@@ -89,7 +95,6 @@ CrossModuleFunctions tsl_cm_functions = {
 
 	/* bgw policies */
 	.policy_compression_add = policy_compression_add,
-	.policy_compression_proc = policy_compression_proc,
 	.policy_compression_remove = policy_compression_remove,
 	.policy_recompression_proc = policy_recompression_proc,
 	.policy_refresh_cagg_add = policy_refresh_cagg_add,
@@ -107,6 +112,7 @@ CrossModuleFunctions tsl_cm_functions = {
 	.job_delete = job_delete,
 	.job_run = job_run,
 	.job_execute = job_execute,
+	.job_config_check = job_config_check,
 
 	/* gapfill */
 	.gapfill_marker = gapfill_marker,
@@ -122,15 +128,27 @@ CrossModuleFunctions tsl_cm_functions = {
 	.move_chunk_proc = tsl_move_chunk_proc,
 	.copy_chunk_proc = tsl_copy_chunk_proc,
 	.copy_chunk_cleanup_proc = tsl_copy_chunk_cleanup_proc,
+
+	/* Continuous Aggregates */
 	.partialize_agg = tsl_partialize_agg,
 	.finalize_agg_sfunc = tsl_finalize_agg_sfunc,
 	.finalize_agg_ffunc = tsl_finalize_agg_ffunc,
 	.process_cagg_viewstmt = tsl_process_continuous_agg_viewstmt,
 	.continuous_agg_invalidation_trigger = continuous_agg_trigfn,
-	.continuous_agg_update_options = continuous_agg_update_options,
+	.continuous_agg_call_invalidation_trigger = execute_cagg_trigger,
 	.continuous_agg_refresh = continuous_agg_refresh,
 	.continuous_agg_refresh_chunk = continuous_agg_refresh_chunk,
-	.continuous_agg_invalidate = invalidation_add_entry,
+	.continuous_agg_invalidate_raw_ht = continuous_agg_invalidate_raw_ht,
+	.continuous_agg_invalidate_mat_ht = continuous_agg_invalidate_mat_ht,
+	.continuous_agg_update_options = continuous_agg_update_options,
+	.invalidation_cagg_log_add_entry = tsl_invalidation_cagg_log_add_entry,
+	.invalidation_hyper_log_add_entry = tsl_invalidation_hyper_log_add_entry,
+	.remote_invalidation_log_delete = remote_invalidation_log_delete,
+	.drop_dist_ht_invalidation_trigger = tsl_drop_dist_ht_invalidation_trigger,
+	.remote_drop_dist_ht_invalidation_trigger = remote_drop_dist_ht_invalidation_trigger,
+	.invalidation_process_hypertable_log = tsl_invalidation_process_hypertable_log,
+	.invalidation_process_cagg_log = tsl_invalidation_process_cagg_log,
+
 	.compressed_data_decompress_forward = tsl_compressed_data_decompress_forward,
 	.compressed_data_decompress_reverse = tsl_compressed_data_decompress_reverse,
 	.compressed_data_send = tsl_compressed_data_send,
@@ -150,7 +168,6 @@ CrossModuleFunctions tsl_cm_functions = {
 	.process_rename_cmd = tsl_process_rename_cmd,
 	.compress_chunk = tsl_compress_chunk,
 	.decompress_chunk = tsl_decompress_chunk,
-	.recompress_chunk = tsl_recompress_chunk,
 	.compress_row_init = compress_row_init,
 	.compress_row_exec = compress_row_exec,
 	.compress_row_end = compress_row_end,
@@ -183,7 +200,7 @@ CrossModuleFunctions tsl_cm_functions = {
 	.sql_drop = tsl_sql_drop,
 	.set_distributed_id = dist_util_set_id,
 	.set_distributed_peer_id = dist_util_set_peer_id,
-	.is_frontend_session = dist_util_is_frontend_session,
+	.is_access_node_session = dist_util_is_access_node_session_on_data_node,
 	.remove_from_distributed_db = dist_util_remove_from_db,
 	.dist_remote_hypertable_info = dist_util_remote_hypertable_info,
 	.dist_remote_chunk_info = dist_util_remote_chunk_info,
@@ -202,6 +219,15 @@ CrossModuleFunctions tsl_cm_functions = {
 	.update_compressed_chunk_relstats = update_compressed_chunk_relstats,
 };
 
+static void
+ts_module_cleanup_on_pg_exit(int code, Datum arg)
+{
+	_tsl_process_utility_fini();
+	_remote_dist_txn_fini();
+	_remote_connection_cache_fini();
+	_continuous_aggs_cache_inval_fini();
+}
+
 TS_FUNCTION_INFO_V1(ts_module_init);
 /*
  * Module init function, sets ts_cm_functions to point at tsl_cm_functions
@@ -217,7 +243,8 @@ ts_module_init(PG_FUNCTION_ARGS)
 	_remote_connection_cache_init();
 	_remote_dist_txn_init();
 	_tsl_process_utility_init();
-
+	/* Register a cleanup function to be called when the backend exits */
+	on_proc_exit(ts_module_cleanup_on_pg_exit, 0);
 	PG_RETURN_BOOL(true);
 }
 
@@ -244,5 +271,5 @@ _PG_init(void)
 PGDLLEXPORT void
 _PG_fini(void)
 {
-	_remote_connection_fini();
+	ts_module_cleanup_on_pg_exit(0, 0);
 }

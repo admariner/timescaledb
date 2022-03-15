@@ -8,11 +8,12 @@
 #include <optimizer/paths.h>
 #include <parser/parsetree.h>
 #include <foreign/fdwapi.h>
+#include <nodes/nodeFuncs.h>
 
-#include "async_append.h"
+#include "nodes/async_append.h"
 #include "nodes/skip_scan/skip_scan.h"
 #include "chunk.h"
-#include "compat.h"
+#include "compat/compat.h"
 #include "debug_guc.h"
 #include "debug.h"
 #include "fdw/data_node_scan_plan.h"
@@ -20,7 +21,7 @@
 #include "fdw/relinfo.h"
 #include "guc.h"
 #include "hypertable_cache.h"
-#include "hypertable_compression.h"
+#include "ts_catalog/hypertable_compression.h"
 #include "hypertable.h"
 #include "nodes/compress_dml/compress_dml.h"
 #include "nodes/decompress_chunk/decompress_chunk.h"
@@ -93,9 +94,19 @@ void
 tsl_set_rel_pathlist_query(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 						   Hypertable *ht)
 {
-	if (ts_guc_enable_transparent_decompression && ht != NULL &&
-		rel->reloptkind == RELOPT_OTHER_MEMBER_REL && TS_HYPERTABLE_HAS_COMPRESSION_TABLE(ht) &&
-		rel->fdw_private != NULL && ((TimescaleDBPrivate *) rel->fdw_private)->compressed)
+	/* We can get here via query on hypertable in that case reloptkind
+	 * will be RELOPT_OTHER_MEMBER_REL or via direct query on chunk
+	 * in that case reloptkind will be RELOPT_BASEREL.
+	 * If we get here via SELECT * FROM <chunk>, we decompress the chunk,
+	 * unless the query was SELECT * FROM ONLY <chunk>.
+	 * We check if it is the ONLY case by calling ts_rte_is_marked_for_expansion.
+	 * Respecting ONLY here is important to not break postgres tools like pg_dump.
+	 */
+	if (ts_guc_enable_transparent_decompression && ht &&
+		(rel->reloptkind == RELOPT_OTHER_MEMBER_REL ||
+		 (rel->reloptkind == RELOPT_BASEREL && ts_rte_is_marked_for_expansion(rte))) &&
+		TS_HYPERTABLE_HAS_COMPRESSION_TABLE(ht) && rel->fdw_private != NULL &&
+		((TimescaleDBPrivate *) rel->fdw_private)->compressed)
 	{
 		Chunk *chunk = ts_chunk_get_by_relid(rte->relid, true);
 
@@ -122,13 +133,23 @@ tsl_set_rel_pathlist_dml(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTbl
 	}
 }
 
-/* The fdw needs to expand a distributed hypertable inside the `GetForeignPath` callback. But, since
- * the hypertable base table is not a foreign table, that callback would not normally be called.
- * Thus, we call it manually in this hook.
+/*
+ * The fdw needs to expand a distributed hypertable inside the `GetForeignPath`
+ * callback. But, since the hypertable base table is not a foreign table, that
+ * callback would not normally be called. Thus, we call it manually in this hook.
  */
 void
 tsl_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte)
 {
+	if (is_dummy_rel(rel))
+	{
+		/*
+		 * Don't have to create any other path if the relation is already proven
+		 * to be empty.
+		 */
+		return;
+	}
+
 	Cache *hcache;
 	Hypertable *ht =
 		ts_hypertable_cache_get_cache_and_entry(rte->relid, CACHE_FLAG_MISSING_OK, &hcache);
@@ -170,6 +191,37 @@ copy_mode_enabled(void)
 }
 
 /*
+ * Query tree walker to examine RTE contents for a distributed hypertable.
+ * Return "true" if we have identified a distributed hypertable. This short-circuits
+ * the tree traversal because we have found what we were looking for.
+ */
+static bool
+distributed_rtes_walker(Node *node, bool *isdistributed)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, RangeTblEntry))
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) node;
+
+		if (rte->rtekind == RTE_RELATION)
+			ts_rte_is_hypertable(rte, isdistributed);
+
+		/* if isdistributed is already set, then no need to walk further */
+		return *isdistributed;
+	}
+	if (IsA(node, Query))
+	{
+		/* Recurse into range tables */
+		return range_table_walker(((Query *) node)->rtable,
+								  distributed_rtes_walker,
+								  isdistributed,
+								  QTW_EXAMINE_RTES_BEFORE);
+	}
+	return expression_tree_walker(node, distributed_rtes_walker, isdistributed);
+}
+
+/*
  * Decide on a plan to use for distributed inserts.
  */
 Path *
@@ -180,12 +232,24 @@ tsl_create_distributed_insert_path(PlannerInfo *root, ModifyTablePath *mtpath, I
 
 	/* Check if it is possible to use COPY in the backend.
 	 *
-	 * There are two cases where we cannot use COPY:
+	 * There are three cases where we cannot use COPY:
 	 *
 	 * 1. ON CONFLICT clause exists
 	 *
 	 * 2. RETURNING clause exists and tuples are expected to be modified on
 	 *    INSERT by a trigger.
+	 *
+	 * 3. INSERT.. SELECT case. If the relation being inserted into and the
+	 *    relation in the SELECT are both distributed hypertables then do not
+	 *    use COPY. This is because only one connection is maintained to data
+	 *    nodes in order to maintain a single snapshot. Normally, it is possible to
+	 *    multiplex multiple queries on a connection using a CURSOR, but with
+	 *    COPY the connection is switched into a COPY_IN state, making
+	 *    multiplexing impossible. It might be possible to use two connections to
+	 *    the same data node (one to ingest data into src table using COPY and
+	 *    one to SELECT from dst table), but that requires coordinating on a single
+	 *    snapshot to use on both connections. This is a potential future
+	 *    optimization.
 	 *
 	 * For case (2), we assume that we can return the original tuples if there
 	 * are no triggers on the root hypertable (we also assume that chunks on
@@ -220,6 +284,46 @@ tsl_create_distributed_insert_path(PlannerInfo *root, ModifyTablePath *mtpath, I
 			}
 
 			table_close(rel, AccessShareLock);
+		}
+
+		/* check if it's a INSERT .. SELECT case involving dist hypertables */
+		if (copy_possible)
+		{
+			ListCell *l;
+			RangeTblEntry *rte = planner_rt_fetch(hypertable_rti, root);
+			bool distributed = false;
+
+			/* if src hypertable is distributed then only further checks are needed */
+			if (ts_rte_is_hypertable(rte, &distributed) && distributed)
+			{
+				/* check if it's indeed INSERT .. SELECT */
+				foreach (l, root->parse->rtable)
+				{
+					rte = (RangeTblEntry *) lfirst(l);
+
+					/*
+					 * check if the subquery SELECT is referring to a distributed hypertable.
+					 * Note that if the target distributed hypertable and the distributed
+					 * hypertables that are part of the SELECT query are disjoint datanodes sets
+					 * then we can allow the existing COPY optimization. However, this is not a very
+					 * common case and not sure if it's worth optimizing for now.
+					 *
+					 * Note that the SELECT could be a complicated one using joins, further
+					 * subqueries etc. So we do a query tree walk to examine rtes
+					 * to check for existence of a distributed hypertable
+					 */
+					if (rte->rtekind == RTE_SUBQUERY)
+					{
+						distributed = false;
+						if (distributed_rtes_walker((Node *) rte->subquery, &distributed) &&
+							distributed)
+						{
+							copy_possible = false;
+							break;
+						}
+					}
+				}
+			}
 		}
 	}
 

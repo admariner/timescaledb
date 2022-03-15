@@ -18,26 +18,31 @@
 #include <extension_constants.h>
 #include <planner.h>
 
-#include "remote/connection.h"
-#include "option.h"
-#include "deparse.h"
-#include "relinfo.h"
-#include "estimate.h"
-#include "chunk_adaptive.h"
 #include "cache.h"
+#include "chunk.h"
+#include "chunk_adaptive.h"
+#include "deparse.h"
+#include "dimension.h"
+#include "errors.h"
+#include "estimate.h"
+#include "extension.h"
+#include "hypercube.h"
 #include "hypertable.h"
 #include "hypertable_cache.h"
-#include "dimension.h"
-#include "chunk.h"
-#include "hypercube.h"
-#include "errors.h"
+#include "option.h"
+#include "relinfo.h"
+#include "remote/connection.h"
 #include "scan_exec.h"
+#include "planner.h"
 
 /* Default CPU cost to start up a foreign query. */
 #define DEFAULT_FDW_STARTUP_COST 100.0
 
 /* Default CPU cost to process 1 row (above and beyond cpu_tuple_cost). */
-#define DEFAULT_FDW_TUPLE_COST 0.01
+/* Note that postgres_fdw sets this to 0.01, but we want to penalize
+ * transferring many tuples in order to make it more attractive to push down
+ * aggregates and thus transfer/process less tuples. */
+#define DEFAULT_FDW_TUPLE_COST 0.08
 
 #define DEFAULT_FDW_FETCH_SIZE 10000
 
@@ -81,46 +86,33 @@ apply_fdw_and_server_options(TsFdwRelInfo *fpinfo)
 TsFdwRelInfo *
 fdw_relinfo_get(RelOptInfo *rel)
 {
-	TimescaleDBPrivate *rel_private;
+	TimescaleDBPrivate *rel_private = rel->fdw_private;
+	TsFdwRelInfo *fdw_relation_info = rel_private->fdw_relation_info;
 
-	if (!rel->fdw_private)
-		ts_create_private_reloptinfo(rel);
+	/*
+	 * This function is expected to return either null or a fully initialized
+	 * fdw_relation_info struct.
+	 */
+	Assert(!fdw_relation_info || fdw_relation_info->type != TS_FDW_RELINFO_UNINITIALIZED);
 
-	rel_private = rel->fdw_private;
-
-	if (!rel_private->fdw_relation_info)
-		rel_private->fdw_relation_info = palloc0(sizeof(TsFdwRelInfo));
-
-	return (TsFdwRelInfo *) rel_private->fdw_relation_info;
+	return fdw_relation_info;
 }
 
 TsFdwRelInfo *
-fdw_relinfo_alloc(RelOptInfo *rel, TsFdwRelInfoType reltype)
+fdw_relinfo_alloc_or_get(RelOptInfo *rel)
 {
-	TimescaleDBPrivate *rel_private;
-	TsFdwRelInfo *fpinfo;
+	TimescaleDBPrivate *rel_private = rel->fdw_private;
+	if (rel_private == NULL)
+	{
+		rel_private = ts_create_private_reloptinfo(rel);
+	}
 
-	if (NULL == rel->fdw_private)
-		ts_create_private_reloptinfo(rel);
+	if (rel_private->fdw_relation_info == NULL)
+	{
+		rel_private->fdw_relation_info = (TsFdwRelInfo *) palloc0(sizeof(TsFdwRelInfo));
+	}
 
-	rel_private = rel->fdw_private;
-
-	fpinfo = (TsFdwRelInfo *) palloc0(sizeof(*fpinfo));
-	rel_private->fdw_relation_info = (void *) fpinfo;
-	fpinfo->type = reltype;
-
-	return fpinfo;
-}
-
-static char *
-get_relation_qualified_name(Oid relid)
-{
-	StringInfo name = makeStringInfo();
-	const char *relname = get_rel_name(relid);
-	const char *namespace = get_namespace_name(get_rel_namespace(relid));
-	appendStringInfo(name, "%s.%s", quote_identifier(namespace), quote_identifier(relname));
-
-	return name->data;
+	return rel_private->fdw_relation_info;
 }
 
 static const double FILL_FACTOR_CURRENT_CHUNK = 0.5;
@@ -153,27 +145,34 @@ get_total_number_of_slices(Hyperspace *space)
 }
 
 /*
- * Fillfactor values are between 0 and 1. It's an indication of how much data is in the chunk.
+ * Estimate fill factor for the chunks that don't have ANALYZE statistics.
+ * Fill factor values are between 0 and 1. It's an indication of how much data is
+ * in the chunk, expressed as a fraction of its estimated final size.
  *
- * Two major drivers for estimation is current time and number of chunks created after.
- *
- * Fill factor estimation assumes that data written is 'recent' in regards to time dimension (eg.
- * almost real-time). For the case when writing historical data, given estimates might be more off
- * as we assume that historical chunks have fill factor 1 unless the number of chunks created after
- * is smaller then total number of slices. Even for writing historical data we might not be totally
+ * Fill factor estimation assumes that data written is 'recent' in regards to
+ * time dimension (eg. almost real-time). For the case when writing historical
+ * data, given estimates might be more off as we assume that historical chunks
+ * have fill factor 1. Even for writing historical data we might not be totally
  * wrong since most probably data has monotonically increasing time.
  *
- * Estimation handles two possible hypertable configurations: 1. time dimension is of timestamp
- * type 2. time dimension is of integer type. If hypertable uses timestamp type to partition data
- * then there are three possible scenarios here: we are beyond chunk end time (historical chunk), we
- * are somewhere in between chunk time boundaries (current chunk) or chunk start time is in the
- * future (highly unlikely). For integer type we assume that all chunks execpt for current have
- * factor 1.
+ * Estimation handles two possible hypertable configurations:
+ * 1. time dimension is of timestamp type
+ * 2. time dimension is of integer type.
  *
- * To explain how number of chunks created after the chunk affects estimation
- * let's imagine that table is space partitioned with one dimension and having 3 partitions. If data
- * is equaliy distributed amount partitions then there will be 3 current chunks. If there are two
- * new chunks created after chunk X then chunk X is the current chunk.
+ * If hypertable uses timestamp type to partition data then there are three
+ * possible scenarios here: we are beyond chunk end time (historical chunk), we
+ * are somewhere in between chunk time boundaries (current chunk) or chunk start
+ * time is in the future (highly unlikely, also treated as current chunk).
+ *
+ * For integer type we assume that all chunks w/o ANALYZE stats are current.
+ * We could use the user-specified integer time function here
+ * (set_integer_now_func()), but this logic is a fallback so we're keeping it
+ * simple for now.
+ *
+ * Earlier, this function used chunk ids to guess which chunks are created later,
+ * and treated such chunks as current. Unfortunately, the chunk ids are global
+ * for all hypertables, so this approach didn't really work if there was more
+ * than one hypertable.
  */
 static double
 estimate_chunk_fillfactor(Chunk *chunk, Hyperspace *space)
@@ -181,119 +180,67 @@ estimate_chunk_fillfactor(Chunk *chunk, Hyperspace *space)
 	const Dimension *time_dim = hyperspace_get_open_dimension(space, 0);
 	const DimensionSlice *time_slice = get_chunk_time_slice(chunk, space);
 	Oid time_dim_type = ts_dimension_get_partition_type(time_dim);
-	int num_created_after = ts_chunk_num_of_chunks_created_after(chunk);
-	int total_slices = get_total_number_of_slices(space);
 
 	if (IS_TIMESTAMP_TYPE(time_dim_type))
 	{
 		TimestampTz now = GetSQLCurrentTimestamp(-1);
-		int64 now_internal_time;
-		double elapsed;
-		double interval;
-
 #ifdef TS_DEBUG
 		if (ts_current_timestamp_override_value >= 0)
 			now = ts_current_timestamp_override_value;
 #endif
-		now_internal_time = ts_time_value_to_internal(TimestampTzGetDatum(now), TIMESTAMPTZOID);
+		int64 now_internal_time =
+			ts_time_value_to_internal(TimestampTzGetDatum(now), TIMESTAMPTZOID);
 
 		/* if we are beyond end range then chunk can possibly be totally filled */
 		if (time_slice->fd.range_end <= now_internal_time)
 		{
-			/* If there are less newly created chunks then the number of slices then this is current
-			 * chunk. This also works better when writing historical data */
-			return num_created_after < total_slices ? FILL_FACTOR_CURRENT_CHUNK :
-													  FILL_FACTOR_HISTORICAL_CHUNK;
+			/*
+			 * Current time is later than the end of the chunk time range, which
+			 * means it is a historical chunk.
+			 */
+			return FILL_FACTOR_HISTORICAL_CHUNK;
 		}
 
-		/* for chunks in future (highly unlikely) we assume same as for `current` chunk */
+		/*
+		 * The chunk time range starts later than current time, so we treat it
+		 * as a current chunk.
+		 */
 		if (time_slice->fd.range_start >= now_internal_time)
 			return FILL_FACTOR_CURRENT_CHUNK;
 
-		/* current time falls within chunk time constraints */
-		elapsed = (now_internal_time - time_slice->fd.range_start);
-		interval = (time_slice->fd.range_end - time_slice->fd.range_start);
+		/*
+		 * Current time falls within chunk time constraints. The fill factor is
+		 * interpolated linearly based on where the current time is inside the
+		 * range, from 'current chunk fill factor' at the start of the range, to
+		 * 'historical chunk fill factor' at the end of the range.
+		 */
+		double elapsed = (now_internal_time - time_slice->fd.range_start);
+		double interval = (time_slice->fd.range_end - time_slice->fd.range_start);
+		Assert(interval > 0);
+		Assert(elapsed <= interval);
 
-		Assert(interval != 0);
+		Assert(FILL_FACTOR_HISTORICAL_CHUNK >= FILL_FACTOR_CURRENT_CHUNK);
+		double fill_factor =
+			FILL_FACTOR_CURRENT_CHUNK +
+			(FILL_FACTOR_HISTORICAL_CHUNK - FILL_FACTOR_CURRENT_CHUNK) * (elapsed / interval);
 
-		return elapsed / interval;
+		Assert(fill_factor >= 0.);
+		Assert(fill_factor <= 1.);
+		return fill_factor;
 	}
-	else
-	{
-		/* if current chunk is the last created we assume it has 0.5 fill factor */
-		return num_created_after < total_slices ? FILL_FACTOR_CURRENT_CHUNK :
-												  FILL_FACTOR_HISTORICAL_CHUNK;
-	}
+
+	/*
+	 * This chunk doesn't have the ANALYZE data, so it's more likely to be a
+	 * recently created, current chunk, not an old historical chunk.
+	 */
+	return FILL_FACTOR_CURRENT_CHUNK;
 }
 
-typedef struct RelEstimates
+static void
+estimate_tuples_and_pages_using_shared_buffers(PlannerInfo *root, Hypertable *ht, RelOptInfo *rel)
 {
-	double tuples;
-	BlockNumber pages;
-} RelEstimates;
-
-/*
- * The idea is to look into number of tuples and pages for N previous chunks
- * and calculate an average. Ideally we could add weights to this calculation
- * and give more importance to newer chunks but a ballpark estimate should be
- * just fine.
- */
-static RelEstimates *
-estimate_tuples_and_pages_using_prev_chunks(PlannerInfo *root, Hyperspace *space,
-											Chunk *current_chunk)
-{
-	RelEstimates *estimates = palloc0(sizeof(RelEstimates));
-	ListCell *lc;
-	float4 total_tuples = 0;
-	int32 total_pages = 0;
-	int non_zero_reltuples_cnt = 0;
-	int non_zero_relpages_cnt = 0;
-	const DimensionSlice *time_slice = get_chunk_time_slice(current_chunk, space);
-	List *prev_chunks = ts_chunk_get_window(time_slice->fd.dimension_id,
-											time_slice->fd.range_start,
-											DEFAULT_CHUNK_LOOKBACK_WINDOW,
-											CurrentMemoryContext);
-
-	foreach (lc, prev_chunks)
-	{
-		Chunk *pc = lfirst(lc);
-		HeapTuple rel_tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(pc->table_id));
-		Form_pg_class rel_form;
-
-		if (!HeapTupleIsValid(rel_tuple))
-			ereport(ERROR,
-					(errcode(ERRCODE_TS_INTERNAL_ERROR),
-					 errmsg("cache lookup failed for chunk relation %u", pc->fd.id),
-					 errdetail("Failed to estimate number of tuples and pages for chunk %d.",
-							   pc->table_id)));
-
-		rel_form = (Form_pg_class) GETSTRUCT(rel_tuple);
-		if (rel_form->reltuples > 0)
-		{
-			total_tuples += rel_form->reltuples;
-			non_zero_reltuples_cnt++;
-		}
-		if (rel_form->relpages > 0)
-		{
-			total_pages += rel_form->relpages;
-			non_zero_relpages_cnt++;
-		}
-		ReleaseSysCache(rel_tuple);
-	}
-
-	if (non_zero_reltuples_cnt > 0)
-		estimates->tuples = total_tuples / non_zero_reltuples_cnt;
-	if (non_zero_relpages_cnt > 0)
-		estimates->pages = total_pages / non_zero_relpages_cnt;
-
-	return estimates;
-}
-
-static RelEstimates *
-estimate_tuples_and_pages_using_shared_buffers(PlannerInfo *root, Hypertable *ht, int result_width)
-{
-	RelEstimates *estimates = palloc(sizeof(RelEstimates));
 	int64 chunk_size_estimate = ts_chunk_calculate_initial_chunk_target_size();
+	const int result_width = rel->reltarget->width;
 
 	if (ht != NULL)
 	{
@@ -305,74 +252,121 @@ estimate_tuples_and_pages_using_shared_buffers(PlannerInfo *root, Hypertable *ht
 		/* half-size seems to be the safest bet */
 		chunk_size_estimate /= 2;
 
-	estimates->tuples = chunk_size_estimate / (result_width + MAXALIGN(SizeofHeapTupleHeader));
-	estimates->pages = chunk_size_estimate / BLCKSZ;
-	return estimates;
-}
-
-static void
-set_rel_estimates(RelOptInfo *rel, RelEstimates *estimates)
-{
-	rel->tuples = estimates->tuples;
-	rel->pages = estimates->pages;
-}
-
-static void
-rel_estimates_apply_fillfactor(RelEstimates *estimates, double fillfactor)
-{
-	estimates->pages *= fillfactor;
-	estimates->tuples *= fillfactor;
+	rel->tuples = chunk_size_estimate / (result_width + MAXALIGN(SizeofHeapTupleHeader));
+	rel->pages = chunk_size_estimate / BLCKSZ;
 }
 
 /*
- * When there are no local stats we try estimating by either using stats from previous chunks (if
- * they exist) or shared buffers size.
+ * Estimate the chunk size if we don't have ANALYZE statistics, and update the
+ * moving average of chunk sizes used for estimation.
  */
 static void
-estimate_tuples_and_pages(PlannerInfo *root, RelOptInfo *rel)
+estimate_chunk_size(PlannerInfo *root, RelOptInfo *chunk_rel)
 {
-	int parent_relid;
-	RangeTblEntry *hyper_rte;
-	Cache *hcache;
-	Hypertable *ht;
-	double chunk_fillfactor;
-	RangeTblEntry *chunk_rte;
-	Chunk *chunk;
-	Hyperspace *hyperspace;
-	RelEstimates *estimates;
-
-	Assert(rel->tuples <= 0);
-	Assert(rel->pages == 0);
-
-	/* In some cases (e.g., UPDATE stmt) top_parent_relids is not set so the best
-		we can do is using shared buffers size without partitioning information.
-	   Since updates are not something we generaly optimize for this should be fine. */
-	if (rel->top_parent_relids == NULL)
+	const int parent_relid = bms_next_member(chunk_rel->top_parent_relids, -1);
+	if (parent_relid < 0)
 	{
-		estimates =
-			estimate_tuples_and_pages_using_shared_buffers(root, NULL, rel->reltarget->width);
-		set_rel_estimates(rel, estimates);
+		/*
+		 * In some cases (e.g., UPDATE stmt) top_parent_relids is not set so the
+		 * best we can do is using shared buffers size without partitioning
+		 * information. Since updates are not something we generaly optimize
+		 * for, this should be fine.
+		 */
+		if (chunk_rel->pages == 0)
+		{
+			/* Can't have nonzero tuples in zero pages */
+			Assert(chunk_rel->tuples <= 0);
+			estimate_tuples_and_pages_using_shared_buffers(root, NULL, chunk_rel);
+		}
 		return;
 	}
 
-	parent_relid = bms_next_member(rel->top_parent_relids, -1);
-	hyper_rte = planner_rt_fetch(parent_relid, root);
-	hcache = ts_hypertable_cache_pin();
-	ht = ts_hypertable_cache_get_entry(hcache, hyper_rte->relid, CACHE_FLAG_NONE);
-	hyperspace = ht->space;
-	chunk_rte = planner_rt_fetch(rel->relid, root);
-	chunk = ts_chunk_get_by_relid(chunk_rte->relid, true);
+	/*
+	 * Check if we have the chunk info cached for this chunk relation. For
+	 * SELECTs, we should have cached it when we performed chunk exclusion.
+	 * The UPDATEs use a completely different code path that doesn't do chunk
+	 * exclusion, so we'll have to look up this info now.
+	 */
+	TimescaleDBPrivate *chunk_private = ts_get_private_reloptinfo(chunk_rel);
+	if (chunk_private->chunk == NULL)
+	{
+		RangeTblEntry *chunk_rte = planner_rt_fetch(chunk_rel->relid, root);
+		chunk_private->chunk =
+			ts_chunk_get_by_relid(chunk_rte->relid, true /* fail_if_not_found */);
+	}
 
-	/* Let's first try figuring out number of tuples/pages using stats from previous chunks,
-	otherwise make an estimation based on shared buffers size */
-	estimates = estimate_tuples_and_pages_using_prev_chunks(root, hyperspace, chunk);
-	if (estimates->tuples <= 0 || estimates->pages == 0)
-		estimates = estimate_tuples_and_pages_using_shared_buffers(root, ht, rel->reltarget->width);
+	RelOptInfo *parent_info = root->simple_rel_array[parent_relid];
+	/*
+	 * The parent FdwRelInfo might not be allocated and initialized here, because
+	 * it happens later in tsl_set_pathlist callback. We don't care about this
+	 * because we only need it for chunk size estimates, so allocate it ourselves.
+	 */
+	TsFdwRelInfo *parent_private = fdw_relinfo_alloc_or_get(parent_info);
+	RangeTblEntry *parent_rte = planner_rt_fetch(parent_relid, root);
+	Cache *hcache = ts_hypertable_cache_pin();
+	Hypertable *ht = ts_hypertable_cache_get_entry(hcache, parent_rte->relid, CACHE_FLAG_NONE);
+	Hyperspace *hyperspace = ht->space;
 
-	chunk_fillfactor = estimate_chunk_fillfactor(chunk, hyperspace);
-	/* adjust tuples/pages using chunk_fillfactor */
-	rel_estimates_apply_fillfactor(estimates, chunk_fillfactor);
-	set_rel_estimates(rel, estimates);
+	const double fillfactor = estimate_chunk_fillfactor(chunk_private->chunk, hyperspace);
+
+	/* Can't have nonzero tuples in zero pages */
+	Assert(parent_private->average_chunk_pages != 0 || parent_private->average_chunk_tuples <= 0);
+	Assert(chunk_rel->pages != 0 || chunk_rel->tuples <= 0);
+
+	const bool have_chunk_statistics = chunk_rel->pages != 0;
+	const bool have_moving_average =
+		parent_private->average_chunk_pages != 0 || parent_private->average_chunk_tuples > 0;
+	if (!have_chunk_statistics)
+	{
+		/*
+		 * If we don't have the statistics from ANALYZE for this chunk,
+		 * use the moving average of chunk sizes. If we don't have even
+		 * that, use an estimate based on the default shared buffers
+		 * size for a chunk.
+		 */
+		if (have_moving_average)
+		{
+			chunk_rel->pages = parent_private->average_chunk_pages * fillfactor;
+			chunk_rel->tuples = parent_private->average_chunk_tuples * fillfactor;
+		}
+		else
+		{
+			estimate_tuples_and_pages_using_shared_buffers(root, ht, chunk_rel);
+			chunk_rel->pages *= fillfactor;
+			chunk_rel->tuples *= fillfactor;
+		}
+	}
+
+	if (!have_moving_average)
+	{
+		/*
+		 * Initialize the moving average data if we don't have any yet.
+		 * Use even a bad estimate from shared buffers, to save on
+		 * recalculating the same bad estimate for the subsequent chunks
+		 * that are likely to not have the statistics as well.
+		 */
+		parent_private->average_chunk_pages = chunk_rel->pages;
+		parent_private->average_chunk_tuples = chunk_rel->tuples;
+	}
+	else if (have_chunk_statistics)
+	{
+		/*
+		 * We have the moving average of chunk sizes and a good estimate
+		 * of this chunk size from ANALYZE. Update the moving average.
+		 */
+		const double f = 0.1;
+		parent_private->average_chunk_pages =
+			(1 - f) * parent_private->average_chunk_pages + f * chunk_rel->pages / fillfactor;
+		parent_private->average_chunk_tuples =
+			(1 - f) * parent_private->average_chunk_tuples + f * chunk_rel->tuples / fillfactor;
+	}
+	else
+	{
+		/*
+		 * Already have some moving average data, but don't have good
+		 * statistics for this chunk. Do nothing.
+		 */
+	}
 
 	ts_cache_release(hcache);
 }
@@ -388,9 +382,13 @@ fdw_relinfo_create(PlannerInfo *root, RelOptInfo *rel, Oid server_oid, Oid local
 
 	/*
 	 * We use TsFdwRelInfo to pass various information to subsequent
-	 * functions.
+	 * functions. It might be already partially initialized for a data node
+	 * hypertable, because we use it to maintain the chunk size estimates when
+	 * planning.
 	 */
-	fpinfo = fdw_relinfo_alloc(rel, type);
+	fpinfo = fdw_relinfo_alloc_or_get(rel);
+	Assert(fpinfo->type == TS_FDW_RELINFO_UNINITIALIZED || fpinfo->type == type);
+	fpinfo->type = type;
 
 	/*
 	 * Set the name of relation in fpinfo, while we are constructing it here.
@@ -401,7 +399,10 @@ fdw_relinfo_create(PlannerInfo *root, RelOptInfo *rel, Oid server_oid, Oid local
 
 	fpinfo->relation_name = makeStringInfo();
 	refname = rte->eref->aliasname;
-	appendStringInfoString(fpinfo->relation_name, get_relation_qualified_name(rte->relid));
+	appendStringInfo(fpinfo->relation_name,
+					 "%s.%s",
+					 quote_identifier(get_namespace_name(get_rel_namespace(rte->relid))),
+					 quote_identifier(get_rel_name(rte->relid)));
 	if (*refname && strcmp(refname, get_rel_name(rte->relid)) != 0)
 		appendStringInfo(fpinfo->relation_name, " %s", quote_identifier(rte->eref->aliasname));
 
@@ -424,7 +425,8 @@ fdw_relinfo_create(PlannerInfo *root, RelOptInfo *rel, Oid server_oid, Oid local
 	 */
 	fpinfo->fdw_startup_cost = DEFAULT_FDW_STARTUP_COST;
 	fpinfo->fdw_tuple_cost = DEFAULT_FDW_TUPLE_COST;
-	fpinfo->shippable_extensions = list_make1_oid(get_extension_oid(EXTENSION_NAME, true));
+	Assert(ts_extension_oid != InvalidOid);
+	fpinfo->shippable_extensions = list_make1_oid(ts_extension_oid);
 	fpinfo->fetch_size = DEFAULT_FDW_FETCH_SIZE;
 
 	apply_fdw_and_server_options(fpinfo);
@@ -475,14 +477,14 @@ fdw_relinfo_create(PlannerInfo *root, RelOptInfo *rel, Oid server_oid, Oid local
 	fpinfo->rel_total_cost = -1;
 	fpinfo->rel_retrieved_rows = -1;
 
-	/*
-	 * If the foreign table has never been ANALYZEd, it will have relpages
-	 * and reltuples equal to zero, which most likely has nothing to do
-	 * with reality. Starting with PG14 it will have reltuples < 0, meaning
-	 * "unknown". The best we can do is estimate number of tuples/pages.
-	 */
-	if (rel->pages == 0 && rel->tuples <= 0 && type == TS_FDW_RELINFO_FOREIGN_TABLE)
-		estimate_tuples_and_pages(root, rel);
+	if (type == TS_FDW_RELINFO_FOREIGN_TABLE)
+	{
+		/*
+		 * For a chunk, estimate its size if we don't know it, and update the
+		 * moving average of chunk sizes used for this estimation.
+		 */
+		estimate_chunk_size(root, rel);
+	}
 
 	/* Estimate rel size as best we can with local statistics. There are
 	 * no local statistics for data node rels since they aren't real base

@@ -10,6 +10,8 @@
 #include <catalog/pg_trigger.h>
 
 #include "compression/create.h"
+#include "continuous_aggs/create.h"
+#include "ts_catalog/continuous_agg.h"
 #include "hypertable_cache.h"
 #include "process_utility.h"
 #include "remote/dist_commands.h"
@@ -33,22 +35,52 @@ tsl_ddl_command_start(ProcessUtilityArgs *args)
 void
 tsl_process_altertable_cmd(Hypertable *ht, const AlterTableCmd *cmd)
 {
-	if (cmd->subtype == AT_AddColumn || cmd->subtype == AT_AddColumnRecurse)
+	switch (cmd->subtype)
 	{
-		if (TS_HYPERTABLE_HAS_COMPRESSION_TABLE(ht) || TS_HYPERTABLE_HAS_COMPRESSION_ENABLED(ht))
-		{
-			ColumnDef *orig_coldef = castNode(ColumnDef, cmd->def);
-			tsl_process_compress_table_add_column(ht, orig_coldef);
-		}
+		case AT_AddColumn:
+		case AT_AddColumnRecurse:
+			if (TS_HYPERTABLE_HAS_COMPRESSION_TABLE(ht) ||
+				TS_HYPERTABLE_HAS_COMPRESSION_ENABLED(ht))
+			{
+				ColumnDef *orig_coldef = castNode(ColumnDef, cmd->def);
+				tsl_process_compress_table_add_column(ht, orig_coldef);
+			}
+			break;
+		case AT_DropColumn:
+		case AT_DropColumnRecurse:
+			if (TS_HYPERTABLE_HAS_COMPRESSION_TABLE(ht) ||
+				TS_HYPERTABLE_HAS_COMPRESSION_ENABLED(ht))
+			{
+				tsl_process_compress_table_drop_column(ht, cmd->name);
+			}
+			break;
+		default:
+			break;
 	}
 }
 
 void
-tsl_process_rename_cmd(Hypertable *ht, const RenameStmt *stmt)
+tsl_process_rename_cmd(Oid relid, Cache *hcache, const RenameStmt *stmt)
 {
 	if (stmt->renameType == OBJECT_COLUMN)
 	{
-		if (TS_HYPERTABLE_HAS_COMPRESSION_TABLE(ht) || TS_HYPERTABLE_HAS_COMPRESSION_ENABLED(ht))
+		Hypertable *ht = ts_hypertable_cache_get_entry(hcache, relid, CACHE_FLAG_MISSING_OK);
+		if (!ht)
+		{
+			ContinuousAgg *cagg = ts_continuous_agg_find_by_relid(relid);
+			if (cagg)
+			{
+				ht = ts_hypertable_cache_get_entry_by_id(hcache, cagg->data.mat_hypertable_id);
+				Assert(ht);
+				cagg_update_view_definition(cagg, ht);
+			}
+		}
+
+		/* Continuous aggregates do not have compression right now, but we
+		 * check the status for the materialized hypertable anyway since it is
+		 * harmless. */
+		if (ht &&
+			(TS_HYPERTABLE_HAS_COMPRESSION_TABLE(ht) || TS_HYPERTABLE_HAS_COMPRESSION_ENABLED(ht)))
 		{
 			tsl_process_compress_table_rename_column(ht, stmt);
 		}
@@ -74,7 +106,7 @@ tsl_process_utility_xact_abort(XactEvent event, void *arg)
 	{
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
-			dist_ddl_reset();
+			dist_ddl_state_reset();
 			break;
 		default:
 			break;
@@ -88,7 +120,7 @@ tsl_process_utility_subxact_abort(SubXactEvent event, SubTransactionId mySubid,
 	switch (event)
 	{
 		case SUBXACT_EVENT_ABORT_SUB:
-			dist_ddl_reset();
+			dist_ddl_state_reset();
 			break;
 		default:
 			break;
@@ -98,7 +130,7 @@ tsl_process_utility_subxact_abort(SubXactEvent event, SubTransactionId mySubid,
 void
 _tsl_process_utility_init(void)
 {
-	dist_ddl_init();
+	dist_ddl_state_init();
 
 	RegisterXactCallback(tsl_process_utility_xact_abort, NULL);
 	RegisterSubXactCallback(tsl_process_utility_subxact_abort, NULL);
@@ -107,7 +139,7 @@ _tsl_process_utility_init(void)
 void
 _tsl_process_utility_fini(void)
 {
-	dist_ddl_reset();
+	dist_ddl_state_reset();
 
 	UnregisterXactCallback(tsl_process_utility_xact_abort, NULL);
 	UnregisterSubXactCallback(tsl_process_utility_subxact_abort, NULL);

@@ -4,6 +4,193 @@
 `psql` with the `-X` flag to prevent any `.psqlrc` commands from
 accidentally triggering the load of a previous DB version.**
 
+## Unreleased
+
+**Bugfixes**
+* #4122 Fix segfault on INSERT into distributed hypertable
+
+## 2.6.0 (2022-02-16)
+This release is medium priority for upgrade. We recommend that you upgrade at the next available opportunity.
+
+This release adds major new features since the 2.5.2 release, including:
+
+* Compression in continuous aggregates
+* Experimental support for timezones in continuous aggregates
+* Experimental support for monthly buckets in continuous aggregates
+
+The release also includes several bug fixes. Telemetry reports now include new and more detailed statistics on regular tables and views, compression, distributed hypertables, and continuous aggregates, which will help us improve TimescaleDB.  
+
+**Features**
+* #3768 Allow ALTER TABLE ADD COLUMN with DEFAULT on compressed hypertable
+* #3769 Allow ALTER TABLE DROP COLUMN on compressed hypertable
+* #3943 Optimize first/last
+* #3945 Add support for ALTER SCHEMA on multi-node
+* #3949 Add support for DROP SCHEMA on multi-node
+
+**Bugfixes**
+* #3808 Properly handle `max_retries` option
+* #3863 Fix remote transaction heal logic
+* #3869 Fix ALTER SET/DROP NULL contstraint on distributed hypertable
+* #3944 Fix segfault in add_compression_policy
+* #3961 Fix crash in EXPLAIN VERBOSE on distributed hypertable
+* #4015 Eliminate float rounding instabilities in interpolate
+* #4019 Update ts_extension_oid in transitioning state
+* #4073 Fix buffer overflow in partition scheme
+
+**Improvements**
+* Query planning performance is improved for hypertables with a large number of chunks.
+
+**Thanks**
+* @fvannee for reporting a first/last memory leak
+* @mmouterde for reporting an issue with floats and interpolate
+
+## 2.5.2 (2022-02-09)
+
+This release contains bug fixes since the 2.5.1 release.
+This release is high priority for upgrade. We strongly recommend that you
+upgrade as soon as possible.
+
+**Bugfixes**
+* #3900 Improve custom scan node registration
+* #3911 Fix role type deparsing for GRANT command
+* #3918 Fix DataNodeScan plans with one-time filter
+* #3921 Fix segfault on insert into internal compressed table
+* #3938 Fix subtract_integer_from_now on 32-bit platforms and improve error handling
+* #3939 Fix projection handling in time_bucket_gapfill
+* #3948 Avoid double PGclear() in data fetchers
+* #3979 Fix deparsing of index predicates
+* #4020 Fix ALTER TABLE EventTrigger initialization
+* #4024 Fix premature cache release call
+* #4037 Fix status for dropped chunks that have catalog entries
+* #4069 Fix riinfo NULL handling in ANY construct
+* #4071 Fix extension installation privilege escalation (CVE-2022-24128)
+
+**Thanks**
+* @carlocperez for reporting crash with NULL handling in ANY construct
+* @erikhh for reporting an issue with time_bucket_gapfill
+* @kancsuki for reporting drop column and partial index creation not working
+* @mmouterde for reporting an issue with floats and interpolate
+* Pedro Gallegos for reporting a possible privilege escalation during extension installation
+
+## 2.5.1 (2021-12-02)
+
+This release contains bug fixes since the 2.5.0 release.
+We deem it medium priority to upgrade.
+
+**Bugfixes**
+* #3706 Test enabling dist compression within a procedure
+* #3734 Rework distributed DDL processing logic
+* #3737 Fix flaky pg_dump
+* #3739 Fix compression policy on tables using INTEGER
+* #3766 Fix segfault in ts_hist_sfunc
+* #3779 Support GRANT/REVOKE on distributed database
+* #3789 Fix time_bucket comparison transformation
+* #3797 Fix DISTINCT ON queries for distributed hyperatbles
+* #3799 Fix error printout on correct security label
+* #3801 Fail size utility functions when data nodes do not respond
+* #3809 Fix NULL pointer evaluation in fill_result_error()
+* #3811 Fix INSERT..SELECT involving dist hypertables
+* #3819 Fix reading garbage value from TSConnectionError
+* #3824 Remove pointers from CAGG lists for 64-bit archs
+* #3846 Eliminate deadlock in recompress chunk policy
+* #3881 Fix SkipScan crash due to pruned unique path
+* #3884 Fix create_distributed_restore_point memory issue
+
+**Thanks**
+* @cbisnett for reporting and fixing a typo in an error message
+* @CaptainCuddleCube for reporting bug on compression policy procedure on tables using INTEGER on time dimension
+* @phemmer for reporting bugs on multi-node
+
+## 2.5.0 (2021-10-28)
+
+This release adds major new features since the 2.4.2 release.
+We deem it moderate priority for upgrading.
+
+This release includes these noteworthy features:
+
+* Continuous Aggregates for Distributed Hypertables
+* Support for PostgreSQL 14
+* Experimental: Support for timezones in `time_bucket_ng()`, including
+the `origin` argument
+
+This release also includes several bug fixes.
+
+**Features**
+* #3034 Add support for PostgreSQL 14
+* #3435 Add continuous aggregates for distributed hypertables
+* #3505 Add support for timezones in `time_bucket_ng()`
+
+**Bugfixes**
+* #3580 Fix memory context bug executing TRUNCATE
+* #3592 Allow alter column type on distributed hypertable
+* #3598 Improve evaluation of stable functions such as now() on access node
+* #3618 Fix execution of refresh_caggs from user actions
+* #3625 Add shared dependencies when creating chunk
+* #3626 Fix memory context bug executing TRUNCATE
+* #3627 Schema qualify UDTs in multi-node
+* #3638 Allow owner change of a data node
+* #3654 Fix index attnum mapping in reorder_chunk
+* #3661 Fix SkipScan path generation with constant DISTINCT column
+* #3667 Fix compress_policy for multi txn handling
+* #3673 Fix distributed hypertable DROP within a procedure
+* #3701 Allow anyone to use size utilities on distributed hypertables
+* #3708 Fix crash in get_aggsplit
+* #3709 Fix ordered append pathkey check
+* #3712 Fix GRANT/REVOKE ALL IN SCHEMA handling
+* #3717 Support transparent decompression on individual chunks
+* #3724 Fix inserts into compressed chunks on hypertables with caggs
+* #3727 Fix DirectFunctionCall crash in distributed_exec
+* #3728 Fix SkipScan with varchar column
+* #3733 Fix ANALYZE crash with custom statistics for custom types
+* #3747 Always reset expr context in DecompressChunk
+
+**Thanks**
+* @binakot and @sebvett for reporting an issue with DISTINCT queries
+* @hardikm10, @DavidPavlicek and @pafiti for reporting bugs on TRUNCATE
+* @mjf for reporting an issue with ordered append and JOINs
+* @phemmer for reporting the issues on multinode with aggregate queries and evaluation of now()
+* @abolognino for reporting an issue with INSERTs into compressed hypertables that have cagg
+* @tanglebones for reporting the ANALYZE crash with custom types on multinode
+* @amadeubarbosa and @felipenogueirajack for reporting crash using JSONB column in compressed chunks
+
+## 2.4.2 (2021-09-21)
+
+This release contains bug fixes since the 2.4.1 release.
+We deem it high priority to upgrade.
+
+**Bugfixes**
+* #3437 Rename on all continuous aggregate objects
+* #3469 Use signal-safe functions in signal handler
+* #3520 Modify compression job processing logic
+* #3527 Fix time_bucket_ng behaviour with origin argument
+* #3532 Fix bootstrap with regresschecks disabled
+* #3574 Fix failure on job execution by background worker
+* #3590 Call cleanup functions on backend exit
+
+**Thanks**
+* @jankatins for reporting a crash with background workers
+* @LutzWeischerFujitsu for reporting an issue with bootstrap
+
+## 2.4.1 (2021-08-19)
+
+This release contains bug fixes since the 2.4.0 release.  We deem it
+high priority to upgrade.
+
+The release fixes continous aggregate refresh for postgres 12.8 and
+13.4, a crash with ALTER TABLE commands and a crash with continuous
+aggregates with HAVING clause.
+
+**Bugfixes**
+* #3430 Fix havingqual processing for continuous aggregates
+* #3468 Disable tests by default if tools are not found
+* #3462 Fix crash while tracking alter table commands
+* #3489 Fix continuous agg bgw job failure for PG 12.8 and 13.4
+* #3494 Improve error message when adding data nodes
+
+**Thanks**
+* @brianbenns for reporting a segfault with continuous aggregates
+* @usego for reporting an issue with continuous aggregate refresh on PG 13.4
+
 ## 2.4.0 (2021-07-29)
 
 This release adds new experimental features since the 2.3.1 release.

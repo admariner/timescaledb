@@ -17,7 +17,7 @@
 
 #include "errors.h"
 #include "guc.h"
-#include "catalog.h"
+#include "ts_catalog/catalog.h"
 #include "debug_point.h"
 #include "dist_util.h"
 #include "remote/dist_commands.h"
@@ -40,6 +40,7 @@ create_restore_point_datum(TupleDesc tupdesc, const char *node_name, XLogRecPtr 
 	Datum values[_Anum_restore_point_max] = { 0 };
 	bool nulls[_Anum_restore_point_max] = { false };
 	HeapTuple tuple;
+	NameData node_name_nd;
 
 	tupdesc = BlessTupleDesc(tupdesc);
 	if (node_name == NULL)
@@ -50,7 +51,8 @@ create_restore_point_datum(TupleDesc tupdesc, const char *node_name, XLogRecPtr 
 	}
 	else
 	{
-		values[AttrNumberGetAttrOffset(Anum_restore_point_node_name)] = CStringGetDatum(node_name);
+		namestrcpy(&node_name_nd, node_name);
+		values[AttrNumberGetAttrOffset(Anum_restore_point_node_name)] = NameGetDatum(&node_name_nd);
 		values[AttrNumberGetAttrOffset(Anum_restore_point_node_type)] =
 			CStringGetTextDatum(TS_DATA_NODE_TYPE);
 	}
@@ -125,11 +127,11 @@ create_distributed_restore_point(PG_FUNCTION_ARGS)
 		 * inconsistent state when the distributed database is restored from a backup
 		 * using the restore point.
 		 *
-		 * To do that we take an exclusive lock on the remote transaction
+		 * To do that we take an access exclusive lock on the remote transaction
 		 * table, which will force any concurrent transaction
 		 * wait during their PREPARE phase.
 		 */
-		LockRelationOid(ts_catalog_get()->tables[REMOTE_TXN].id, ExclusiveLock);
+		LockRelationOid(ts_catalog_get()->tables[REMOTE_TXN].id, AccessExclusiveLock);
 
 		/* Prevent situation when new data node added during the execution */
 		LockRelationOid(ForeignServerRelationId, ExclusiveLock);

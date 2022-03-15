@@ -128,9 +128,13 @@ ORDER BY hypertable_schema, hypertable_name;
 SELECT pg_table_size('disttable'), pg_relation_size('disttable'), pg_indexes_size('disttable'), pg_total_relation_size('disttable');
 SELECT pg_table_size(ch), pg_relation_size(ch), pg_indexes_size(ch), pg_total_relation_size(ch)
 FROM show_chunks('disttable') ch;
+SELECT * FROM _timescaledb_internal.relation_size('disttable');
+SELECT * FROM show_chunks('disttable') ch JOIN LATERAL _timescaledb_internal.relation_size(ch) ON TRUE;
 SELECT pg_table_size('nondisttable'), pg_relation_size('nondisttable'), pg_indexes_size('nondisttable'), pg_total_relation_size('nondisttable');
 SELECT pg_table_size(ch), pg_relation_size(ch), pg_indexes_size(ch), pg_total_relation_size(ch)
 FROM show_chunks('nondisttable') ch;
+SELECT * FROM _timescaledb_internal.relation_size('nondisttable');
+SELECT * FROM show_chunks('nondisttable') ch JOIN LATERAL _timescaledb_internal.relation_size(ch) ON TRUE;
 
 SELECT * FROM hypertable_size('disttable');
 SELECT * FROM hypertable_size('nondisttable');
@@ -149,7 +153,9 @@ ALTER TABLE nondisttable ADD CONSTRAINT nondisttable_pkey PRIMARY KEY (time);
 ALTER TABLE disttable ADD CONSTRAINT disttable_pkey PRIMARY KEY (time);
 
 SELECT pg_table_size('disttable'), pg_relation_size('disttable'), pg_indexes_size('disttable'), pg_total_relation_size('disttable');
+SELECT * FROM _timescaledb_internal.relation_size('disttable');
 SELECT pg_table_size('nondisttable'), pg_relation_size('nondisttable'), pg_indexes_size('nondisttable'), pg_total_relation_size('nondisttable');
+SELECT * FROM _timescaledb_internal.relation_size('nondisttable');
 
 -- Note that the empty disttable is three times the size of the
 -- nondisttable since it has primary key indexes on two data nodes in
@@ -175,9 +181,13 @@ INSERT INTO disttable SELECT * FROM nondisttable;
 SELECT pg_table_size('disttable'), pg_relation_size('disttable'), pg_indexes_size('disttable'), pg_total_relation_size('disttable');
 SELECT pg_table_size(ch), pg_relation_size(ch), pg_indexes_size(ch), pg_total_relation_size(ch)
 FROM show_chunks('disttable') ch;
+SELECT * FROM _timescaledb_internal.relation_size('disttable');
+SELECT * FROM show_chunks('disttable') ch JOIN LATERAL _timescaledb_internal.relation_size(ch) ON TRUE;
 SELECT pg_table_size('nondisttable'), pg_relation_size('nondisttable'), pg_indexes_size('nondisttable'), pg_total_relation_size('nondisttable');
 SELECT pg_table_size(ch), pg_relation_size(ch), pg_indexes_size(ch), pg_total_relation_size(ch)
 FROM show_chunks('nondisttable') ch;
+SELECT * FROM _timescaledb_internal.relation_size('nondisttable');
+SELECT * FROM show_chunks('nondisttable') ch JOIN LATERAL _timescaledb_internal.relation_size(ch) ON TRUE;
 
 SELECT * FROM hypertable_size('disttable');
 SELECT * FROM hypertable_detailed_size('disttable') ORDER BY node_name;
@@ -193,9 +203,13 @@ VACUUM FULL ANALYZE disttable;
 SELECT pg_table_size('disttable'), pg_relation_size('disttable'), pg_indexes_size('disttable'), pg_total_relation_size('disttable');
 SELECT pg_table_size(ch), pg_relation_size(ch), pg_indexes_size(ch)
 FROM show_chunks('disttable') ch;
+SELECT * FROM _timescaledb_internal.relation_size('disttable');
+SELECT * FROM show_chunks('disttable') ch JOIN LATERAL _timescaledb_internal.relation_size(ch) ON TRUE;
 SELECT pg_table_size('nondisttable'), pg_relation_size('nondisttable'), pg_indexes_size('nondisttable'), pg_total_relation_size('nondisttable');
 SELECT pg_table_size(ch), pg_relation_size(ch), pg_indexes_size(ch), pg_total_relation_size(ch)
 FROM show_chunks('nondisttable') ch;
+SELECT * FROM _timescaledb_internal.relation_size('nondisttable');
+SELECT * FROM show_chunks('nondisttable') ch JOIN LATERAL _timescaledb_internal.relation_size(ch) ON TRUE;
 
 SELECT * FROM hypertable_size('disttable');
 SELECT * FROM hypertable_detailed_size('disttable') ORDER BY node_name;
@@ -277,6 +291,55 @@ SELECT * FROM chunk_compression_stats('disttable') ORDER BY chunk_schema, chunk_
 SELECT * FROM chunk_compression_stats('nondisttable') ORDER BY chunk_schema, chunk_name, node_name;
 SELECT * FROM hypertable_index_size('disttable_pkey');
 SELECT * FROM hypertable_index_size('nondisttable_pkey');
+
+-- Make sure functions work for non-superuser
+CREATE TABLE size_test_table (value int);
+INSERT INTO size_test_table SELECT * FROM generate_series(0, 10000);
+
+SET ROLE :ROLE_1;
+
+-- No query permissions
+\set ON_ERROR_STOP 0
+SELECT count(*) FROM disttable;
+SELECT count(*) FROM size_test_table;
+\set ON_ERROR_STOP 1
+
+-- Size functions work anyway, similar to pg_table_size, et al.
+-- pg_table_size() can vary with platform so not outputting
+SELECT 1 FROM pg_table_size('size_test_table');
+SELECT 1 FROM pg_table_size('disttable');
+SELECT 1 FROM pg_table_size('nondisttable');
+SELECT * FROM hypertable_size('disttable');
+SELECT * FROM hypertable_size('nondisttable');
+SELECT * FROM hypertable_detailed_size('disttable') ORDER BY node_name;
+SELECT * FROM hypertable_detailed_size('nondisttable') ORDER BY node_name;
+SELECT * FROM chunks_detailed_size('disttable') ORDER BY chunk_schema, chunk_name, node_name;
+SELECT * FROM chunks_detailed_size('nondisttable') ORDER BY chunk_schema, chunk_name, node_name;
+SELECT * FROM hypertable_compression_stats('disttable') ORDER BY node_name;
+SELECT * FROM hypertable_compression_stats('nondisttable') ORDER BY node_name;
+SELECT * FROM chunk_compression_stats('disttable') ORDER BY chunk_schema, chunk_name, node_name;
+SELECT * FROM chunk_compression_stats('nondisttable') ORDER BY chunk_schema, chunk_name, node_name;
+SELECT * FROM hypertable_index_size('disttable_pkey');
+SELECT * FROM hypertable_index_size('nondisttable_pkey');
+
+RESET ROLE;
+GRANT SELECT ON disttable TO :ROLE_1;
+SET ROLE :ROLE_1;
+-- Querying should now work
+SELECT count(*) FROM disttable;
+
+-- Make sure timescaledb.ssl_dir and passfile gucs can be read by a non-superuser
+\c :TEST_DBNAME :ROLE_1
+\unset ECHO
+\o /dev/null
+SHOW timescaledb.ssl_dir;
+SHOW timescaledb.passfile;
+\o
+\set ECHO all
+\set ON_ERROR_STOP 0
+SET timescaledb.ssl_dir TO 'ssldir';
+SET timescaledb.passfile TO 'passfile';
+\set ON_ERROR_STOP 1
 
 \c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER
 SET client_min_messages TO ERROR;

@@ -16,7 +16,6 @@
 #include <catalog/pg_foreign_server.h>
 #include <catalog/pg_user_mapping.h>
 #include <commands/defrem.h>
-#include <common/md5.h>
 #include <foreign/foreign.h>
 #include <libpq-events.h>
 #include <libpq/libpq.h>
@@ -36,11 +35,15 @@
 #include <errors.h>
 #include <extension_constants.h>
 #include <guc.h>
+#ifdef USE_TELEMETRY
 #include <telemetry/telemetry_metadata.h>
+#endif
 #include "connection.h"
 #include "data_node.h"
 #include "debug_point.h"
 #include "utils.h"
+#include "ts_catalog/metadata.h"
+#include "config.h"
 
 /*
  * Connection library for TimescaleDB.
@@ -288,8 +291,17 @@ fill_result_error(TSConnectionError *err, int errcode, const char *errmsg, const
 	const ResultEntry *entry = PQresultInstanceData(res, eventproc);
 	const char *sqlstate;
 
-	if (NULL == err || NULL == res)
+	if (NULL == err || NULL == res || NULL == entry)
+	{
+		if (err)
+		{
+			MemSet(err, 0, sizeof(*err));
+			err->errcode = errcode;
+			err->msg = errmsg;
+			err->nodename = "";
+		}
 		return false;
+	}
 
 	Assert(entry->conn);
 
@@ -301,6 +313,8 @@ fill_result_error(TSConnectionError *err, int errcode, const char *errmsg, const
 	err->remote.hint = get_error_field_copy(res, PG_DIAG_MESSAGE_HINT);
 	err->remote.context = get_error_field_copy(res, PG_DIAG_CONTEXT);
 	err->remote.stmtpos = get_error_field_copy(res, PG_DIAG_STATEMENT_POSITION);
+	if (err->remote.msg == NULL)
+		err->remote.msg = pstrdup(PQresultErrorMessage(res));
 
 	sqlstate = err->remote.sqlstate;
 
@@ -868,14 +882,36 @@ remote_connection_get_result_error(const PGresult *res, TSConnectionError *err)
 PGresult *
 remote_connection_exec(TSConnection *conn, const char *cmd)
 {
+	PGresult *res;
+
 	if (!remote_connection_configure_if_changed(conn))
 	{
-		PGresult *res = PQmakeEmptyPGresult(conn->pg_conn, PGRES_FATAL_ERROR);
+		res = PQmakeEmptyPGresult(conn->pg_conn, PGRES_FATAL_ERROR);
 		PQfireResultCreateEvents(conn->pg_conn, res);
 		return res;
 	}
 
-	return PQexec(conn->pg_conn, cmd);
+	res = PQexec(conn->pg_conn, cmd);
+
+	/*
+	 * Workaround for the libpq disconnect case.
+	 *
+	 * libpq disconnect will create an result object without creating
+	 * events, which is usually done for a regular errors.
+	 *
+	 * In order to be compatible with our error handling code, force
+	 * create result event, if the result object does not have
+	 * it already.
+	 */
+	if (res)
+	{
+		ExecStatusType status = PQresultStatus(res);
+		ResultEntry *entry = PQresultInstanceData(res, eventproc);
+
+		if (status == PGRES_FATAL_ERROR && entry == NULL)
+			PQfireResultCreateEvents(conn->pg_conn, res);
+	}
+	return res;
 }
 
 /*
@@ -1053,7 +1089,9 @@ remote_connection_check_extension(TSConnection *conn)
 static bool
 remote_connection_set_peer_dist_id(TSConnection *conn)
 {
-	Datum id_string = DirectFunctionCall1(uuid_out, ts_telemetry_metadata_get_uuid());
+	bool isnull;
+	Datum uuid = ts_metadata_get_value(METADATA_UUID_KEY_NAME, UUIDOID, &isnull);
+	Datum id_string = DirectFunctionCall1(uuid_out, uuid);
 	PGresult *res;
 	bool success = true;
 
@@ -1150,8 +1188,9 @@ make_user_path(const char *user_name, PathKind path_kind)
 	char ret_path[MAXPGPATH];
 	char hexsum[33];
 	StringInfo result;
+	const char *errstr;
 
-	pg_md5_hash(user_name, strlen(user_name), hexsum);
+	pg_md5_hash_compat(user_name, strlen(user_name), hexsum, &errstr);
 
 	if (strlcpy(ret_path, ts_guc_ssl_dir ? ts_guc_ssl_dir : DataDir, MAXPGPATH) > MAXPGPATH)
 		report_path_error(path_kind, user_name);
@@ -1461,11 +1500,11 @@ options_contain(List *options, const char *key)
 }
 
 /*
- * Add user info (username and optionally password) to the connection
+ * Add athentication info (username and optionally password) to the connection
  * options).
  */
-static List *
-add_userinfo_to_server_options(ForeignServer *server, Oid user_id)
+List *
+remote_connection_prepare_auth_options(const ForeignServer *server, Oid user_id)
 {
 	const UserMapping *um = get_user_mapping(user_id, server->serverid);
 	List *options = list_copy(server->options);
@@ -1544,7 +1583,7 @@ remote_connection_get_connstr(const char *node_name)
 	int i;
 
 	server = data_node_get_foreign_server(node_name, ACL_NO_CHECK, false, false);
-	connection_options = add_userinfo_to_server_options(server, GetUserId());
+	connection_options = remote_connection_prepare_auth_options(server, GetUserId());
 	setup_full_connection_options(connection_options, &keywords, &values);
 
 	/* Cycle through the options and create the connection string */
@@ -1574,7 +1613,7 @@ TSConnection *
 remote_connection_open_by_id(TSConnectionId id)
 {
 	ForeignServer *server = GetForeignServer(id.server_id);
-	List *connection_options = add_userinfo_to_server_options(server, id.user_id);
+	List *connection_options = remote_connection_prepare_auth_options(server, id.user_id);
 
 	return remote_connection_open_with_options(server->servername, connection_options, true);
 }
@@ -1607,7 +1646,7 @@ remote_connection_open_nothrow(Oid server_id, Oid user_id, char **errmsg)
 		return NULL;
 	}
 
-	connection_options = add_userinfo_to_server_options(server, user_id);
+	connection_options = remote_connection_prepare_auth_options(server, user_id);
 	conn =
 		remote_connection_open_with_options_nothrow(server->servername, connection_options, errmsg);
 
@@ -1845,6 +1884,8 @@ remote_connection_cancel_query(TSConnection *conn)
 
 	if (!conn)
 		return true;
+
+	memset(&err, 0, sizeof(TSConnectionError));
 
 	/*
 	 * Catch exceptions so that we can ensure the status is IDLE after the

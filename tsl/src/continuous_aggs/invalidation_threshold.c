@@ -14,14 +14,14 @@
 #include <utils/memutils.h>
 #include <utils/snapmgr.h>
 
-#include <catalog.h>
+#include "ts_catalog/catalog.h"
 #include <scanner.h>
 #include <scan_iterator.h>
-#include <compat.h>
+#include <compat/compat.h>
 #include <time_utils.h>
 #include <time_bucket.h>
 
-#include "continuous_agg.h"
+#include "ts_catalog/continuous_agg.h"
 #include "continuous_aggs/materialize.h"
 #include "invalidation_threshold.h"
 
@@ -33,7 +33,7 @@
  * amplification in "hot" regions---typically the "head" of the table. The
  * presumption is that most inserts happen at recent time intervals, and those
  * intervals will be invalid until writes move out of them. Therefore, it
- * isnt't worth writing invalidations in that region since it is presumed
+ * isn't worth writing invalidations in that region since it is presumed
  * out-of-date anyway. Further, although it is possible to refresh a
  * continuous aggregate in those "hot" regions, it will lead to partially
  * filled buckets. Thus, refreshing those intervals is discouraged since the
@@ -43,7 +43,7 @@
  * the threshold but not after it.
  *
  * The invalidation threshold is moved forward (and only forward) by refreshes
- * on continuous aggregates when it covers a window that streches beyond the
+ * on continuous aggregates when it covers a window that stretches beyond the
  * current threshold. The invalidation threshold needs to be moved in its own
  * transaction, with exclusive access, before the refresh starts to
  * materialize data. This is to avoid losing any invalidations that occur
@@ -57,6 +57,11 @@
  *                                        |
  *                               invalidation threshold
  *
+ * Transactions that use an isolation level stronger than READ COMMITTED will
+ * not be able to "see" changes to the invalidation threshold that may have
+ * been made while they were running. Therefore, they always create records
+ * in the hypertable invalidation log. See the cache_inval_entry_write()
+ * implementation in tsl/src/continuous_aggs/insert.c
  */
 
 typedef struct InvalidationThresholdData
@@ -294,13 +299,41 @@ invalidation_threshold_compute(const ContinuousAgg *cagg, const InternalTimeRang
 
 		if (isnull)
 		{
-			/* No data in hypertable, so return min (start of time) */
-			return ts_time_get_min(refresh_window->type);
+			/* No data in hypertable */
+			if (ts_continuous_agg_bucket_width_variable(cagg))
+			{
+				/*
+				 * To determine inscribed/circumscribed refresh window for variable-sized
+				 * buckets we should be able to calculate time_bucket(window.begin) and
+				 * time_bucket(window.end). This, however, is not possible in general case.
+				 * As an example, the minimum date is 4714-11-24 BC, which is before any
+				 * reasonable default `origin` value. Thus for variable-sized buckets
+				 * instead of minimum date we use -infinity since time_bucket(-infinity)
+				 * is well-defined as -infinity.
+				 *
+				 * For more details see:
+				 * - ts_compute_inscribed_bucketed_refresh_window_variable()
+				 * - ts_compute_circumscribed_bucketed_refresh_window_variable()
+				 */
+				return ts_time_get_nobegin(refresh_window->type);
+			}
+			else
+			{
+				/* For fixed-sized buckets return min (start of time) */
+				return ts_time_get_min(refresh_window->type);
+			}
 		}
 		else
 		{
-			int64 bucket_width = ts_continuous_agg_bucket_width(cagg);
 			int64 maxval = ts_time_value_to_internal(maxdat, refresh_window->type);
+
+			if (ts_continuous_agg_bucket_width_variable(cagg))
+			{
+				return ts_compute_beginning_of_the_next_bucket_variable(maxval,
+																		cagg->bucket_function);
+			}
+
+			int64 bucket_width = ts_continuous_agg_bucket_width(cagg);
 			int64 bucket_start = ts_time_bucket_by_type(bucket_width, maxval, refresh_window->type);
 			/* Add one bucket to get to the end of the last bucket */
 			return ts_time_saturating_add(bucket_start, bucket_width, refresh_window->type);

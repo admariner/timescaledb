@@ -79,8 +79,46 @@ DELETE FROM _timescaledb_catalog.metadata WHERE key = 'dist_uuid';
 SELECT * FROM add_data_node('bootstrap_test', host => 'localhost',
                             database => 'bootstrap_test', bootstrap => false);
 
-SELECT * FROM delete_data_node('bootstrap_test');
+\set ON_ERROR_STOP 0
+-- Dropping the database with delete_data_node should not work in a
+-- transaction block since it is non-transactional.
+BEGIN;
+SELECT * FROM delete_data_node('bootstrap_test', drop_database => true);
+ROLLBACK;
+\set ON_ERROR_STOP 1
+
+-- Using the drop_database option when there are active connections to
+-- the data node should fail. But any connections in the current
+-- session should be cleared when dropping the database. To test that
+-- the connection is cleared, first create a connection in the
+-- connection cache by inserting some data
+CREATE TABLE conditions (time timestamptz, device int, temp float);
+SELECT create_distributed_hypertable('conditions', 'time', 'device');
+INSERT INTO conditions VALUES ('2021-12-01 10:30', 1, 20.3);
+DROP TABLE conditions;
+
+-- Now drop the data node and it should clear the connection from the
+-- cache first
+SELECT * FROM delete_data_node('bootstrap_test', drop_database => true);
+
+\set ON_ERROR_STOP 0
+-- Dropping the database now should fail since it no longer exists
 DROP DATABASE bootstrap_test;
+\set ON_ERROR_STOP 1
+
+-- Adding the data node again should work
+SELECT * FROM add_data_node('bootstrap_test', host => 'localhost',
+                            database => 'bootstrap_test', bootstrap => true);
+-- Now drop the database manually before using the drop_database option
+DROP DATABASE bootstrap_test;
+\set ON_ERROR_STOP 0
+-- Expect an error since the database does not exist. 
+SELECT * FROM delete_data_node('bootstrap_test', drop_database => true);
+\set ON_ERROR_STOP 1
+
+-- Delete it without the drop_database option set since the database
+-- was manually deleted.
+SELECT * FROM delete_data_node('bootstrap_test');
 
 ----------------------------------------------------------------------
 -- Do a manual bootstrap of the data node and check that it can be
@@ -90,8 +128,7 @@ CREATE DATABASE bootstrap_test OWNER :ROLE_CLUSTER_SUPERUSER;
 
 \c bootstrap_test :ROLE_CLUSTER_SUPERUSER
 SET client_min_messages TO ERROR;
-CREATE SCHEMA _timescaledb_catalog AUTHORIZATION :ROLE_CLUSTER_SUPERUSER;
-CREATE EXTENSION timescaledb WITH SCHEMA _timescaledb_catalog CASCADE;
+CREATE EXTENSION timescaledb;
 SET client_min_messages TO NOTICE;
 
 \c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER
@@ -110,8 +147,7 @@ CREATE DATABASE bootstrap_test OWNER :ROLE_CLUSTER_SUPERUSER;
 
 \c bootstrap_test :ROLE_CLUSTER_SUPERUSER;
 SET client_min_messages TO ERROR;
-CREATE SCHEMA _timescaledb_catalog AUTHORIZATION :ROLE_CLUSTER_SUPERUSER;
-CREATE EXTENSION timescaledb WITH SCHEMA _timescaledb_catalog CASCADE;
+CREATE EXTENSION timescaledb;
 SET client_min_messages TO NOTICE;
 
 \c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER;
@@ -168,8 +204,7 @@ CREATE DATABASE bootstrap_test
 
 \c bootstrap_test :ROLE_CLUSTER_SUPERUSER;
 SET client_min_messages TO ERROR;
-CREATE SCHEMA _timescaledb_catalog AUTHORIZATION :ROLE_CLUSTER_SUPERUSER;
-CREATE EXTENSION timescaledb WITH SCHEMA _timescaledb_catalog CASCADE;
+CREATE EXTENSION timescaledb;
 SET client_min_messages TO NOTICE;
 
 \c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER;
@@ -189,8 +224,7 @@ CREATE DATABASE bootstrap_test
 
 \c bootstrap_test :ROLE_CLUSTER_SUPERUSER;
 SET client_min_messages TO ERROR;
-CREATE SCHEMA _timescaledb_catalog AUTHORIZATION :ROLE_CLUSTER_SUPERUSER;
-CREATE EXTENSION timescaledb WITH SCHEMA _timescaledb_catalog CASCADE;
+CREATE EXTENSION timescaledb;
 SET client_min_messages TO NOTICE;
 
 \c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER;
@@ -210,8 +244,7 @@ CREATE DATABASE bootstrap_test
 
 \c bootstrap_test :ROLE_CLUSTER_SUPERUSER;
 SET client_min_messages TO ERROR;
-CREATE SCHEMA _timescaledb_catalog AUTHORIZATION :ROLE_CLUSTER_SUPERUSER;
-CREATE EXTENSION timescaledb WITH SCHEMA _timescaledb_catalog CASCADE;
+CREATE EXTENSION timescaledb;
 SET client_min_messages TO NOTICE;
 
 \c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER;
@@ -270,8 +303,8 @@ CREATE DATABASE access_node OWNER :ROLE_CLUSTER_SUPERUSER;
 
 \c access_node :ROLE_CLUSTER_SUPERUSER
 SET client_min_messages TO ERROR;
-CREATE SCHEMA _timescaledb_catalog AUTHORIZATION :ROLE_CLUSTER_SUPERUSER;
-CREATE EXTENSION timescaledb WITH SCHEMA _timescaledb_catalog CASCADE;
+CREATE SCHEMA ts_non_default AUTHORIZATION :ROLE_CLUSTER_SUPERUSER;
+CREATE EXTENSION timescaledb WITH SCHEMA ts_non_default CASCADE;
 SET client_min_messages TO NOTICE;
 
 -- Show the schema for the extension to verify that it is not public.
@@ -282,7 +315,7 @@ CREATE DATABASE bootstrap_test OWNER :ROLE_CLUSTER_SUPERUSER;
 
 \c bootstrap_test :ROLE_CLUSTER_SUPERUSER
 SET client_min_messages TO ERROR;
-CREATE SCHEMA _timescaledb_catalog AUTHORIZATION :ROLE_CLUSTER_SUPERUSER;
+CREATE SCHEMA ts_non_default AUTHORIZATION :ROLE_CLUSTER_SUPERUSER;
 SET client_min_messages TO NOTICE;
 
 \c access_node :ROLE_CLUSTER_SUPERUSER
@@ -290,10 +323,10 @@ SET client_min_messages TO NOTICE;
 -- Add data node and delete it under error suppression. We want to
 -- avoid later tests to have random failures because the add succeeds.
 \set ON_ERROR_STOP 0
-SELECT * FROM _timescaledb_catalog.add_data_node(
+SELECT * FROM ts_non_default.add_data_node(
        'bootstrap_test', host => 'localhost',
        database => 'bootstrap_test', bootstrap => true);
-SELECT * FROM _timescaledb_catalog.delete_data_node('bootstrap_test');
+SELECT * FROM ts_non_default.delete_data_node('bootstrap_test');
 \set ON_ERROR_STOP 1
 
 \c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER
@@ -358,11 +391,59 @@ SELECT substr(label, 0, 10) || ':uuid'
 
 \c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER;
 
--- Check that timescaledb security label cannot be used directly
-\set ON_ERROR_STOP 0
+-- Check that timescaledb security label cannot be used directly. To
+-- support pg_dump, we do not print an error when a proper label is
+-- used, but print an error if something that doesn't look like a
+-- distributed uuid is used.
 SECURITY LABEL FOR timescaledb
     ON DATABASE drop_db_test
-    IS 'dist_uuid:00000000-0000-0000-0000-00000000000';
+    IS 'dist_uuid:4ab3b1bc-438f-11ec-8919-23804e22321a';
+\set ON_ERROR_STOP 0
+\set VERBOSITY default
+-- No colon
+SECURITY LABEL FOR timescaledb
+    ON DATABASE drop_db_test
+    IS 'bad_label';
+-- Bad tag, but still an UUID
+SECURITY LABEL FOR timescaledb
+    ON DATABASE drop_db_test
+    IS 'uuid:4ab3b1bc-438f-11ec-8919-23804e22321a';
+-- Length is not correct
+SECURITY LABEL FOR timescaledb
+    ON DATABASE drop_db_test
+    IS 'dist_uuid:4ab3b1bcd-438f-11ec-8919-23804e2232';
+SECURITY LABEL FOR timescaledb
+    ON DATABASE drop_db_test
+    IS 'dist_uuid:4ab3b1bcd-438f-11ec-8919-23804e223215';
+-- Length is correct, but it contains something that is not a
+-- hexadecimal digit.
+SECURITY LABEL FOR timescaledb
+    ON DATABASE drop_db_test
+    IS 'dist_uuid:4ab3b1bcd-4x8f-11ec-8919-23804e22321';
+-- Total length is correct, but not the right number of hyphens.
+SECURITY LABEL FOR timescaledb
+    ON DATABASE drop_db_test
+    IS 'dist_uuid:4ab3-1bcd-438f-11ec-8919-23804e22321';
+SECURITY LABEL FOR timescaledb
+    ON DATABASE drop_db_test
+    IS 'dist_uuid:4ab3b1bcd438f-11ec-8919-23804e223213';
+-- Total length is correct, but length of groups is not
+SECURITY LABEL FOR timescaledb
+    ON DATABASE drop_db_test
+    IS 'dist_uuid:4ab3b1bcd-438f-11ec-8919-23804e22321';
+SECURITY LABEL FOR timescaledb
+    ON DATABASE drop_db_test
+    IS 'dist_uuid:4ab3b1bc-438f-11ec-891-23804e22321ab';
+SECURITY LABEL FOR timescaledb
+    ON DATABASE drop_db_test
+    IS 'dist_uuid:4ab3b1bc-438f-11e-8919-23804e22321ab';
+SECURITY LABEL FOR timescaledb
+    ON DATABASE drop_db_test
+    IS 'dist_uuid:4ab3b1bc-438-11ec-8919-23804e22321ab';
+SECURITY LABEL FOR timescaledb
+    ON DATABASE drop_db_test
+    IS 'dist_uuid:4ab3b1bca-438f-11ec-8919-23804e22321';
+\set VERBOSITY terse
 \set ON_ERROR_STOP 1
 
 -- Check that security label functionality is working

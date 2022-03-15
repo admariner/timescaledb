@@ -13,7 +13,7 @@
 #include <foreign/foreign.h>
 
 #include "export.h"
-#include "catalog.h"
+#include "ts_catalog/catalog.h"
 #include "chunk_constraint.h"
 #include "hypertable.h"
 #include "export.h"
@@ -99,6 +99,7 @@ typedef struct ChunkScanCtx
 	int num_processed;
 	bool early_abort;
 	LOCKMODE lockmode;
+
 	void *data;
 } ChunkScanCtx;
 
@@ -118,16 +119,22 @@ typedef struct ChunkScanEntry
 	ChunkStub *stub;
 } ChunkScanEntry;
 
+/*
+ * Information to be able to display a scan key details for error messages.
+ */
+typedef struct DisplayKeyData
+{
+	const char *name;
+	const char *(*as_string)(Datum);
+} DisplayKeyData;
+
+extern void ts_chunk_formdata_fill(FormData_chunk *fd, const TupleInfo *ti);
 extern Chunk *ts_chunk_create_from_point(const Hypertable *ht, const Point *p, const char *schema,
 										 const char *prefix);
 
 extern TSDLLEXPORT Chunk *ts_chunk_create_base(int32 id, int16 num_constraints, const char relkind);
 extern TSDLLEXPORT ChunkStub *ts_chunk_stub_create(int32 id, int16 num_constraints);
 extern Chunk *ts_chunk_find(const Hypertable *ht, const Point *p, bool lock_slices);
-extern Chunk **ts_chunk_find_all(const Hypertable *ht, const List *dimension_vecs,
-								 LOCKMODE lockmode, unsigned int *num_chunks);
-extern List *ts_chunk_find_all_oids(const Hypertable *ht, const List *dimension_vecs,
-									LOCKMODE lockmode);
 extern TSDLLEXPORT Chunk *ts_chunk_copy(const Chunk *chunk);
 extern TSDLLEXPORT Chunk *ts_chunk_get_by_name_with_memory_context(const char *schema_name,
 																   const char *table_name,
@@ -139,6 +146,7 @@ extern TSDLLEXPORT Oid ts_chunk_create_table(const Chunk *chunk, const Hypertabl
 											 const char *tablespacename);
 extern TSDLLEXPORT Chunk *ts_chunk_get_by_id(int32 id, bool fail_if_not_found);
 extern TSDLLEXPORT Chunk *ts_chunk_get_by_relid(Oid relid, bool fail_if_not_found);
+extern TSDLLEXPORT void ts_chunk_free(Chunk *chunk);
 extern bool ts_chunk_exists(const char *schema_name, const char *table_name);
 extern Oid ts_chunk_get_relid(int32 chunk_id, bool missing_ok);
 extern Oid ts_chunk_get_schema_id(int32 chunk_id, bool missing_ok);
@@ -174,6 +182,8 @@ ts_chunk_find_or_create_without_cuts(const Hypertable *ht, Hypercube *hc, const 
 extern TSDLLEXPORT Chunk *ts_chunk_get_compressed_chunk_parent(const Chunk *chunk);
 extern TSDLLEXPORT bool ts_chunk_is_unordered(const Chunk *chunk);
 extern TSDLLEXPORT bool ts_chunk_is_compressed(const Chunk *chunk);
+extern TSDLLEXPORT bool ts_chunk_is_uncompressed_or_unordered(const Chunk *chunk);
+
 extern TSDLLEXPORT bool ts_chunk_contains_compressed_data(const Chunk *chunk);
 extern TSDLLEXPORT ChunkCompressionStatus ts_chunk_get_compression_status(int32 chunk_id);
 extern TSDLLEXPORT Datum ts_chunk_id_from_relid(PG_FUNCTION_ARGS);
@@ -188,11 +198,30 @@ extern TSDLLEXPORT Chunk *ts_chunk_create_only_table(Hypertable *ht, Hypercube *
 extern TSDLLEXPORT int64 ts_chunk_primary_dimension_start(const Chunk *chunk);
 
 extern TSDLLEXPORT int64 ts_chunk_primary_dimension_end(const Chunk *chunk);
+extern Chunk *ts_chunk_build_from_tuple_and_stub(Chunk **chunkptr, TupleInfo *ti,
+												 const ChunkStub *stub);
+
+extern ScanIterator ts_chunk_scan_iterator_create(MemoryContext result_mcxt);
+extern void ts_chunk_scan_iterator_set_chunk_id(ScanIterator *it, int32 chunk_id);
+extern bool ts_chunk_lock_if_exists(Oid chunk_oid, LOCKMODE chunk_lockmode);
+extern int ts_chunk_oid_cmp(const void *p1, const void *p2);
 
 #define chunk_get_by_name(schema_name, table_name, fail_if_not_found)                              \
 	ts_chunk_get_by_name_with_memory_context(schema_name,                                          \
 											 table_name,                                           \
 											 CurrentMemoryContext,                                 \
 											 fail_if_not_found)
+
+#define IS_VALID_CHUNK(chunk)                                                                      \
+	((chunk) && !(chunk)->fd.dropped && (chunk)->fd.id > 0 && (chunk)->fd.hypertable_id > 0 &&     \
+	 OidIsValid((chunk)->table_id) && OidIsValid((chunk)->hypertable_relid) &&                     \
+	 (chunk)->constraints && (chunk)->cube &&                                                      \
+	 (chunk)->cube->num_slices == (chunk)->constraints->num_dimension_constraints &&               \
+	 ((chunk)->relkind == RELKIND_RELATION ||                                                      \
+	  ((chunk)->relkind == RELKIND_FOREIGN_TABLE && (chunk)->data_nodes != NIL)))
+
+#define ASSERT_IS_VALID_CHUNK(chunk) Assert(IS_VALID_CHUNK(chunk))
+
+#define ASSERT_IS_NULL_OR_VALID_CHUNK(chunk) Assert(chunk == NULL || IS_VALID_CHUNK(chunk))
 
 #endif /* TIMESCALEDB_CHUNK_H */

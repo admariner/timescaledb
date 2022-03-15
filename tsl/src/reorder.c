@@ -51,8 +51,10 @@
 #include <utils/snapmgr.h>
 #include <utils/syscache.h>
 #include <utils/tuplesort.h>
+#include <executor/spi.h>
+#include <utils/snapmgr.h>
 
-#include "compat.h"
+#include "compat/compat.h"
 #if PG13_LT
 #include <access/tuptoaster.h>
 #else
@@ -182,6 +184,9 @@ tsl_move_chunk(PG_FUNCTION_ARGS)
 
 		AlterTableInternal(chunk_id, list_make1(&cmd), false);
 		AlterTableInternal(compressed_chunk->table_id, list_make1(&cmd), false);
+		/* move indexes on original and compressed chunk */
+		ts_chunk_index_move_all(chunk_id, index_destination_tablespace);
+		ts_chunk_index_move_all(compressed_chunk->table_id, index_destination_tablespace);
 	}
 	else
 	{
@@ -210,6 +215,9 @@ tsl_copy_or_move_chunk_proc(FunctionCallInfo fcinfo, bool delete_on_src_node)
 	Oid chunk_id = PG_ARGISNULL(0) ? InvalidOid : PG_GETARG_OID(0);
 	const char *src_node_name = PG_ARGISNULL(1) ? NULL : NameStr(*PG_GETARG_NAME(1));
 	const char *dst_node_name = PG_ARGISNULL(2) ? NULL : NameStr(*PG_GETARG_NAME(2));
+	int rc;
+	bool nonatomic = fcinfo->context && IsA(fcinfo->context, CallContext) &&
+					 !castNode(CallContext, fcinfo->context)->atomic;
 
 	TS_PREVENT_FUNC_IF_READ_ONLY();
 
@@ -224,8 +232,14 @@ tsl_copy_or_move_chunk_proc(FunctionCallInfo fcinfo, bool delete_on_src_node)
 	if (!OidIsValid(chunk_id))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid chunk")));
 
+	if ((rc = SPI_connect_ext(nonatomic ? SPI_OPT_NONATOMIC : 0)) != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed: %s", SPI_result_code_string(rc));
+
 	/* perform the actual distributed chunk move after a few sanity checks */
 	chunk_copy(chunk_id, src_node_name, dst_node_name, delete_on_src_node);
+
+	if ((rc = SPI_finish()) != SPI_OK_FINISH)
+		elog(ERROR, "SPI_finish failed: %s", SPI_result_code_string(rc));
 }
 
 Datum
@@ -248,6 +262,9 @@ Datum
 tsl_copy_chunk_cleanup_proc(PG_FUNCTION_ARGS)
 {
 	const char *operation_id = PG_ARGISNULL(0) ? NULL : NameStr(*PG_GETARG_NAME(0));
+	int rc;
+	bool nonatomic = fcinfo->context && IsA(fcinfo->context, CallContext) &&
+					 !castNode(CallContext, fcinfo->context)->atomic;
 
 	TS_PREVENT_FUNC_IF_READ_ONLY();
 
@@ -259,8 +276,14 @@ tsl_copy_chunk_cleanup_proc(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("invalid chunk copy operation id")));
 
+	if ((rc = SPI_connect_ext(nonatomic ? SPI_OPT_NONATOMIC : 0)) != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed: %s", SPI_result_code_string(rc));
+
 	/* perform the cleanup/repair depending on the stage */
 	chunk_copy_cleanup(operation_id);
+
+	if ((rc = SPI_finish()) != SPI_OK_FINISH)
+		elog(ERROR, "SPI_finish failed: %s", SPI_result_code_string(rc));
 
 	PG_RETURN_VOID();
 }
@@ -549,7 +572,11 @@ timescale_rebuild_relation(Relation OldHeap, Oid indexOid, bool verbose, Oid wai
 	table_close(OldHeap, NoLock);
 
 	/* Create the transient table that will receive the re-ordered data */
-	OIDNewHeap = make_new_heap(tableOid, tableSpace, relpersistence, ExclusiveLock);
+	OIDNewHeap = make_new_heap_compat(tableOid,
+									  tableSpace,
+									  OldHeap->rd_rel->relam,
+									  relpersistence,
+									  ExclusiveLock);
 
 	/* Copy the heap data into the new table in the desired order */
 	copy_heap_data(OIDNewHeap,
@@ -697,9 +724,6 @@ copy_heap_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex, bool verbose,
 						  0,
 						  0,
 						  0,
-#if PG14_GE
-						  true,
-#endif
 						  &OldestXmin,
 						  &FreezeXid,
 						  NULL,

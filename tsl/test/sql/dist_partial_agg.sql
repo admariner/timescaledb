@@ -33,6 +33,7 @@ SELECT table_name FROM create_distributed_hypertable( 'conditions', 'timec', 'lo
 \ir 'include/aggregate_table_populate.sql'
 
 SET enable_partitionwise_aggregate = ON;
+SET timescaledb.remote_data_fetcher = 'cursor';
 
 -- Run an explain on the aggregate queries to make sure expected aggregates are being pushed down.
 -- Grouping by the paritioning column should result in full aggregate pushdown where possible,
@@ -42,7 +43,7 @@ SET enable_partitionwise_aggregate = ON;
 \set GROUPING 'location'
 \ir 'include/aggregate_queries.sql'
 
-\set GROUPING 'region'
+\set GROUPING 'region, temperature'
 \ir 'include/aggregate_queries.sql'
 
 -- Full aggregate pushdown correctness check, compare location grouped query results with partionwise aggregates on and off
@@ -94,10 +95,6 @@ CALL distributed_exec($$ SET enable_partitionwise_aggregate = ON $$);
 \o
 \set ECHO all
 
--- Note that some difference in output could happen here because
--- queries include last(col, time) and first(col, time); there are
--- multiple values for "col" that has the same timestamp, so the
--- output depends on the order of arriving tuples.
 :DIFF_CMD2
 
 \c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER

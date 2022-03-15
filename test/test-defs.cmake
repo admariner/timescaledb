@@ -6,6 +6,7 @@ set(TEST_ROLE_DEFAULT_PERM_USER_2 default_perm_user_2)
 set(TEST_ROLE_1 test_role_1)
 set(TEST_ROLE_2 test_role_2)
 set(TEST_ROLE_3 test_role_3)
+set(TEST_ROLE_READ_ONLY test_role_read_only)
 
 # TEST_ROLE_2 has password in passfile
 set(TEST_ROLE_2_PASS pass)
@@ -41,7 +42,14 @@ set(TEST_PASSFILE ${TEST_OUTPUT_DIR}/pgpass.conf)
 configure_file(${PRIMARY_TEST_DIR}/pg_hba.conf.in pg_hba.conf)
 set(TEST_PG_HBA_FILE ${TEST_OUTPUT_DIR}/pg_hba.conf)
 
+if(USE_TELEMETRY)
+  set(TELEMETRY_DEFAULT_SETTING "timescaledb.telemetry_level=off")
+else()
+  set(TELEMETRY_DEFAULT_SETTING)
+endif()
 configure_file(postgresql.conf.in postgresql.conf)
+configure_file(max_bgw_8.conf.in max_bgw_8.conf)
+configure_file(${PRIMARY_TEST_DIR}/pgtest.conf.in pgtest.conf)
 
 # pgpass file requires chmod 0600
 configure_file(${PRIMARY_TEST_DIR}/pgpass.conf.in
@@ -56,7 +64,7 @@ set(PG_REGRESS_OPTS_BASE --host=${TEST_PGHOST}
                          --dlpath=${PROJECT_BINARY_DIR}/src)
 
 set(PG_REGRESS_OPTS_EXTRA
-    --create-role=${TEST_ROLE_SUPERUSER},${TEST_ROLE_DEFAULT_PERM_USER},${TEST_ROLE_DEFAULT_PERM_USER_2},${TEST_ROLE_CLUSTER_SUPERUSER},${TEST_ROLE_1},${TEST_ROLE_2},${TEST_ROLE_3}
+    --create-role=${TEST_ROLE_SUPERUSER},${TEST_ROLE_DEFAULT_PERM_USER},${TEST_ROLE_DEFAULT_PERM_USER_2},${TEST_ROLE_CLUSTER_SUPERUSER},${TEST_ROLE_1},${TEST_ROLE_2},${TEST_ROLE_3},${TEST_ROLE_READ_ONLY}
     --dbname=${TEST_DBNAME}
     --launcher=${PRIMARY_TEST_DIR}/runner.sh)
 
@@ -66,7 +74,7 @@ set(PG_REGRESS_SHARED_OPTS_EXTRA
     --launcher=${PRIMARY_TEST_DIR}/runner_shared.sh)
 
 set(PG_ISOLATION_REGRESS_OPTS_EXTRA
-    --create-role=${TEST_ROLE_SUPERUSER},${TEST_ROLE_DEFAULT_PERM_USER},${TEST_ROLE_DEFAULT_PERM_USER_2},${TEST_ROLE_CLUSTER_SUPERUSER},${TEST_ROLE_1},${TEST_ROLE_2},${TEST_ROLE_3}
+    --create-role=${TEST_ROLE_SUPERUSER},${TEST_ROLE_DEFAULT_PERM_USER},${TEST_ROLE_DEFAULT_PERM_USER_2},${TEST_ROLE_CLUSTER_SUPERUSER},${TEST_ROLE_1},${TEST_ROLE_2},${TEST_ROLE_3},${TEST_ROLE_READ_ONLY}
     --dbname=${TEST_DBNAME})
 
 set(PG_REGRESS_OPTS_INOUT --inputdir=${TEST_INPUT_DIR}
@@ -86,7 +94,7 @@ set(PG_REGRESS_OPTS_TEMP_INSTANCE
 
 set(PG_REGRESS_OPTS_TEMP_INSTANCE_PGTEST
     --port=${TEST_PGPORT_TEMP_INSTANCE} --temp-instance=${TEST_CLUSTER}
-    --temp-config=${TEST_INPUT_DIR}/pgtest.conf)
+    --temp-config=${TEST_OUTPUT_DIR}/pgtest.conf)
 
 set(PG_REGRESS_OPTS_LOCAL_INSTANCE --port=${TEST_PGPORT_LOCAL})
 
@@ -101,6 +109,7 @@ if(PG_REGRESS)
       TEST_ROLE_1=${TEST_ROLE_1}
       TEST_ROLE_2=${TEST_ROLE_2}
       TEST_ROLE_3=${TEST_ROLE_3}
+      TEST_ROLE_READ_ONLY=${TEST_ROLE_READ_ONLY}
       TEST_ROLE_2_PASS=${TEST_ROLE_2_PASS}
       TEST_ROLE_3_PASS=${TEST_ROLE_3_PASS}
       TEST_DBNAME=${TEST_DBNAME}
@@ -123,6 +132,7 @@ if(PG_ISOLATION_REGRESS)
       TEST_ROLE_3=${TEST_ROLE_3}
       TEST_ROLE_2_PASS=${TEST_2_PASS}
       TEST_ROLE_3_PASS=${TEST_3_PASS}
+      TEST_ROLE_READ_ONLY=${TEST_ROLE_READ_ONLY}
       TEST_DBNAME=${TEST_DBNAME}
       TEST_INPUT_DIR=${TEST_INPUT_DIR}
       TEST_OUTPUT_DIR=${TEST_OUTPUT_DIR}

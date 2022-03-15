@@ -12,6 +12,9 @@
 #include "cross_module_fn.h"
 #include "guc.h"
 #include "bgw/job.h"
+#ifdef USE_TELEMETRY
+#include "telemetry/telemetry.h"
+#endif
 
 #define CROSSMODULE_WRAPPER(func)                                                                  \
 	TS_FUNCTION_INFO_V1(ts_##func);                                                                \
@@ -22,7 +25,6 @@
 
 /* bgw policy functions */
 CROSSMODULE_WRAPPER(policy_compression_add);
-CROSSMODULE_WRAPPER(policy_compression_proc);
 CROSSMODULE_WRAPPER(policy_compression_remove);
 CROSSMODULE_WRAPPER(policy_recompression_proc);
 CROSSMODULE_WRAPPER(policy_refresh_cagg_add);
@@ -68,12 +70,16 @@ CROSSMODULE_WRAPPER(array_compressor_append);
 CROSSMODULE_WRAPPER(array_compressor_finish);
 CROSSMODULE_WRAPPER(compress_chunk);
 CROSSMODULE_WRAPPER(decompress_chunk);
-CROSSMODULE_WRAPPER(recompress_chunk);
 
 /* continous aggregate */
 CROSSMODULE_WRAPPER(continuous_agg_invalidation_trigger);
 CROSSMODULE_WRAPPER(continuous_agg_refresh);
 CROSSMODULE_WRAPPER(continuous_agg_refresh_chunk);
+CROSSMODULE_WRAPPER(invalidation_cagg_log_add_entry);
+CROSSMODULE_WRAPPER(invalidation_hyper_log_add_entry);
+CROSSMODULE_WRAPPER(drop_dist_ht_invalidation_trigger);
+CROSSMODULE_WRAPPER(invalidation_process_hypertable_log);
+CROSSMODULE_WRAPPER(invalidation_process_cagg_log);
 
 CROSSMODULE_WRAPPER(data_node_ping);
 CROSSMODULE_WRAPPER(data_node_block_new_chunks);
@@ -148,14 +154,23 @@ error_no_default_fn_bool_void_community(void)
 	pg_unreachable();
 }
 
+#ifdef USE_TELEMETRY
 static void
 add_tsl_telemetry_info_default(JsonbParseState **parse_state)
 {
 	error_no_default_fn_community();
 }
+#endif
 
 static bool
 job_execute_default_fn(BgwJob *job)
+{
+	error_no_default_fn_community();
+	pg_unreachable();
+}
+
+static void
+job_config_check_default_fn(Name proc_schema, Name proc_name, Jsonb *config)
 {
 	error_no_default_fn_community();
 	pg_unreachable();
@@ -217,7 +232,26 @@ continuous_agg_update_options_default(ContinuousAgg *cagg, WithClauseResult *wit
 }
 
 static void
-continuous_agg_invalidate_all_default(const Hypertable *ht, int64 start, int64 end)
+continuous_agg_invalidate_raw_ht_all_default(const Hypertable *raw_ht, int64 start, int64 end)
+{
+	error_no_default_fn_community();
+	pg_unreachable();
+}
+
+static void
+continuous_agg_invalidate_mat_ht_all_default(const Hypertable *raw_ht, const Hypertable *mat_ht,
+											 int64 start, int64 end)
+{
+	error_no_default_fn_community();
+	pg_unreachable();
+}
+
+static void
+continuous_agg_call_invalidation_trigger_default(int32 hypertable_id, Relation chunk_rel,
+												 HeapTuple chunk_tuple, HeapTuple chunk_newtuple,
+												 bool update,
+												 bool is_distributed_hypertable_trigger,
+												 int32 parent_hypertable_id)
 {
 	error_no_default_fn_community();
 	pg_unreachable();
@@ -293,7 +327,9 @@ ts_tsl_loaded(PG_FUNCTION_ARGS)
  * exception.
  */
 TSDLLEXPORT CrossModuleFunctions ts_cm_functions_default = {
+#ifdef USE_TELEMETRY
 	.add_tsl_telemetry_info = add_tsl_telemetry_info_default,
+#endif
 	.create_upper_paths_hook = NULL,
 	.set_rel_pathlist_dml = NULL,
 	.set_rel_pathlist_query = NULL,
@@ -315,7 +351,6 @@ TSDLLEXPORT CrossModuleFunctions ts_cm_functions_default = {
 
 	/* bgw policies */
 	.policy_compression_add = error_no_default_fn_pg_community,
-	.policy_compression_proc = error_no_default_fn_pg_community,
 	.policy_compression_remove = error_no_default_fn_pg_community,
 	.policy_recompression_proc = error_no_default_fn_pg_community,
 	.policy_refresh_cagg_add = error_no_default_fn_pg_community,
@@ -333,6 +368,7 @@ TSDLLEXPORT CrossModuleFunctions ts_cm_functions_default = {
 	.job_delete = error_no_default_fn_pg_community,
 	.job_run = error_no_default_fn_pg_community,
 	.job_execute = job_execute_default_fn,
+	.job_config_check = job_config_check_default_fn,
 
 	.move_chunk = error_no_default_fn_pg_community,
 	.move_chunk_proc = error_no_default_fn_pg_community,
@@ -345,10 +381,19 @@ TSDLLEXPORT CrossModuleFunctions ts_cm_functions_default = {
 	.finalize_agg_ffunc = error_no_default_fn_pg_community,
 	.process_cagg_viewstmt = process_cagg_viewstmt_default,
 	.continuous_agg_invalidation_trigger = error_no_default_fn_pg_community,
+	.continuous_agg_call_invalidation_trigger = continuous_agg_call_invalidation_trigger_default,
 	.continuous_agg_refresh = error_no_default_fn_pg_community,
 	.continuous_agg_refresh_chunk = error_no_default_fn_pg_community,
-	.continuous_agg_invalidate = continuous_agg_invalidate_all_default,
+	.continuous_agg_invalidate_raw_ht = continuous_agg_invalidate_raw_ht_all_default,
+	.continuous_agg_invalidate_mat_ht = continuous_agg_invalidate_mat_ht_all_default,
 	.continuous_agg_update_options = continuous_agg_update_options_default,
+	.invalidation_cagg_log_add_entry = error_no_default_fn_pg_community,
+	.invalidation_hyper_log_add_entry = error_no_default_fn_pg_community,
+	.remote_invalidation_log_delete = NULL,
+	.drop_dist_ht_invalidation_trigger = error_no_default_fn_pg_community,
+	.remote_drop_dist_ht_invalidation_trigger = NULL,
+	.invalidation_process_hypertable_log = error_no_default_fn_pg_community,
+	.invalidation_process_cagg_log = error_no_default_fn_pg_community,
 
 	/* compression */
 	.compressed_data_send = error_no_default_fn_pg_community,
@@ -358,7 +403,6 @@ TSDLLEXPORT CrossModuleFunctions ts_cm_functions_default = {
 	.process_compress_table = process_compress_table_default,
 	.compress_chunk = error_no_default_fn_pg_community,
 	.decompress_chunk = error_no_default_fn_pg_community,
-	.recompress_chunk = error_no_default_fn_pg_community,
 	.compressed_data_decompress_forward = error_no_default_fn_pg_community,
 	.compressed_data_decompress_reverse = error_no_default_fn_pg_community,
 	.deltadelta_compressor_append = error_no_default_fn_pg_community,
@@ -400,7 +444,7 @@ TSDLLEXPORT CrossModuleFunctions ts_cm_functions_default = {
 	.distributed_copy = distributed_copy_default,
 	.set_distributed_id = set_distributed_id_default,
 	.set_distributed_peer_id = set_distributed_peer_id_default,
-	.is_frontend_session = error_no_default_fn_bool_void_community,
+	.is_access_node_session = error_no_default_fn_bool_void_community,
 	.remove_from_distributed_db = error_no_default_fn_bool_void_community,
 	.dist_remote_hypertable_info = error_no_default_fn_pg_community,
 	.dist_remote_chunk_info = error_no_default_fn_pg_community,

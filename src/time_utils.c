@@ -12,6 +12,7 @@
 #include <parser/parse_coerce.h>
 #include <fmgr.h>
 
+#include "time_bucket.h"
 #include "dimension.h"
 #include "guc.h"
 #include "time_utils.h"

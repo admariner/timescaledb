@@ -17,6 +17,8 @@
 \set MY_DB2 :TEST_DBNAME _2
 \set MY_DB3 :TEST_DBNAME _3
 
+CREATE SCHEMA some_schema AUTHORIZATION :ROLE_1;
+
 SELECT * FROM add_data_node('data_node_1', host => 'localhost', database => :'MY_DB1');
 SELECT * FROM add_data_node('data_node_2', host => 'localhost', database => :'MY_DB2');
 SELECT * FROM add_data_node('data_node_3', host => 'localhost', database => :'MY_DB3');
@@ -38,21 +40,18 @@ SET client_min_messages TO ERROR;
 \c :MY_DB3
 SET client_min_messages TO ERROR;
 \ir :TEST_SUPPORT_FILE
-\c :TEST_DBNAME :ROLE_SUPERUSER;
+--\c :TEST_DBNAME :ROLE_SUPERUSER;
+\c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER;
 \o
 SET client_min_messages TO NOTICE;
 \set ECHO all
 
--- This SCHEMA will not be created on data nodes
-CREATE SCHEMA disttable_schema AUTHORIZATION :ROLE_1;
-CREATE SCHEMA some_schema AUTHORIZATION :ROLE_1;
 SET ROLE :ROLE_1;
-
 CREATE TABLE disttable(time timestamptz, device int, color int CONSTRAINT color_check CHECK (color > 0), temp float);
-CREATE UNIQUE INDEX disttable_pk ON disttable(time);
+CREATE UNIQUE INDEX disttable_pk ON disttable(time, temp);
 
 -- CREATE TABLE
-SELECT * FROM create_distributed_hypertable('disttable', 'time', replication_factor => 3);
+SELECT * FROM create_distributed_hypertable('disttable', 'time', 'temp', replication_factor => 3);
 SELECT * FROM test.show_columns('disttable');
 SELECT * FROM test.show_constraints('disttable');
 SELECT * FROM test.show_indexes('disttable');
@@ -101,6 +100,17 @@ TRUNCATE non_disttable1, non_disttable2;
 -- Truncating one distributed hypertable should be OK
 TRUNCATE disttable;
 
+-- RENAME TO
+ALTER TABLE disttable RENAME TO disttable2;
+ALTER TABLE disttable2 RENAME TO disttable;
+
+-- SET SCHEMA
+ALTER TABLE disttable SET SCHEMA some_schema;
+ALTER TABLE some_schema.disttable SET SCHEMA public;
+\set ON_ERROR_STOP 0
+ALTER TABLE disttable SET SCHEMA some_unexist_schema;
+\set ON_ERROR_STOP 1
+
 -- Test unsupported operations on distributed hypertable
 \set ON_ERROR_STOP 0
 
@@ -119,20 +129,28 @@ TRUNCATE disttable, non_disttable2;
 
 CLUSTER disttable USING disttable_description_idx;
 
-ALTER TABLE disttable ALTER COLUMN description TYPE INT;
-ALTER TABLE disttable RENAME TO disttable2;
-ALTER TABLE disttable SET SCHEMA some_unexist_schema;
-ALTER TABLE disttable SET SCHEMA some_schema;
-
 DROP TABLE non_disttable1, disttable;
 DROP TABLE disttable, non_disttable2;
 DROP TABLE disttable, disttable;
 
 \set ON_ERROR_STOP 1
 
---------------------------------------------------------------------
--- Test renaming columns, constraints, indexes, and REINDEX command.
---------------------------------------------------------------------
+----------------------------------------------------------------------------------------
+-- Test column type change, renaming columns, constraints, indexes, and REINDEX command.
+----------------------------------------------------------------------------------------
+ALTER TABLE disttable ALTER COLUMN description TYPE VARCHAR(10);
+
+ALTER TABLE disttable ADD COLUMN float_col float;
+ALTER TABLE disttable ALTER COLUMN float_col TYPE INT USING float_col::int;
+
+\set ON_ERROR_STOP 0
+-- Changing the type of a hash-partitioned column should not be supported
+ALTER TABLE disttable ALTER COLUMN temp TYPE numeric;
+\set ON_ERROR_STOP 1
+
+-- Should be able to change if not hash partitioned though
+ALTER TABLE disttable ALTER COLUMN time TYPE timestamp;
+
 INSERT INTO disttable VALUES
 	('2017-01-01 06:01', 1, 1.2, 'test'),
 	('2017-01-01 09:11', 3, 4.3, 'test'),
@@ -230,30 +248,95 @@ SELECT * FROM test.remote_exec(NULL, $$ SELECT 1 FROM pg_tables WHERE tablename 
 DROP TABLE non_disttable1;
 DROP TABLE non_disttable2;
 
--- Test current SCHEMA limitations
--- CREATE TABLE should fail, since remote data nodes has no schema
-\set ON_ERROR_STOP 0
-CREATE TABLE disttable_schema.disttable(time timestamptz, device int, color int, temp float);
-SELECT test.execute_sql_and_filter_data_node_name_on_error($$
-SELECT * FROM create_hypertable('disttable_schema.disttable', 'time', replication_factor => 3)
+-- CREATE SCHEMA tests
+\c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER;
+CREATE SCHEMA dist_schema AUTHORIZATION :ROLE_1;
+
+-- make sure schema has been created on each data node
+SELECT * FROM test.remote_exec(NULL, $$
+SELECT s.nspname, u.usename
+FROM pg_catalog.pg_namespace s
+JOIN pg_catalog.pg_user u ON u.usesysid = s.nspowner
+WHERE s.nspname = 'dist_schema';
 $$);
-SELECT * FROM test.remote_exec(NULL, $$ SELECT schemaname, tablename FROM pg_tables WHERE tablename = 'disttable' $$);
 
--- CREATE and DROP SCHEMA CASCADE
-\c :MY_DB1
-CREATE SCHEMA some_schema AUTHORIZATION :ROLE_1;
-\c :MY_DB2
-CREATE SCHEMA some_schema AUTHORIZATION :ROLE_1;
-\c :MY_DB3
-CREATE SCHEMA some_schema AUTHORIZATION :ROLE_1;
-\c :TEST_DBNAME :ROLE_SUPERUSER;
-SET ROLE :ROLE_1;
+CREATE TABLE dist_schema.some_dist_table(time timestamptz, device int, color int, temp float);
+SELECT * FROM create_hypertable('dist_schema.some_dist_table', 'time', replication_factor => 3);
+SELECT * FROM test.remote_exec(NULL, $$ SELECT schemaname, tablename FROM pg_tables WHERE tablename = 'some_dist_table' $$);
 
-CREATE TABLE some_schema.some_dist_table(time timestamptz, device int, color int, temp float);
-SELECT * FROM create_hypertable('some_schema.some_dist_table', 'time', replication_factor => 3);
+-- DROP SCHEMA
+DROP SCHEMA dist_schema CASCADE;
 SELECT * FROM test.remote_exec(NULL, $$ SELECT schemaname, tablename FROM pg_tables WHERE tablename = 'some_dist_table' $$);
-DROP SCHEMA some_schema CASCADE;
+
+-- make sure schema has been dropped on each data node
+SELECT * FROM test.remote_exec(NULL, $$
+SELECT s.nspname, u.usename
+FROM pg_catalog.pg_namespace s
+JOIN pg_catalog.pg_user u ON u.usesysid = s.nspowner
+WHERE s.nspname = 'dist_schema';
+$$);
+
+-- make sure empty schema schema has been created and then dropped on each data node
+CREATE SCHEMA dist_schema_2;
+
+SELECT * FROM test.remote_exec(NULL, $$
+SELECT s.nspname, u.usename
+FROM pg_catalog.pg_namespace s
+JOIN pg_catalog.pg_user u ON u.usesysid = s.nspowner
+WHERE s.nspname = 'dist_schema_2';
+$$);
+
+DROP SCHEMA dist_schema_2;
+
+SELECT * FROM test.remote_exec(NULL, $$
+SELECT s.nspname, u.usename
+FROM pg_catalog.pg_namespace s
+JOIN pg_catalog.pg_user u ON u.usesysid = s.nspowner
+WHERE s.nspname = 'dist_schema_2';
+$$);
+
+-- transactional schema create/drop with local table
+BEGIN;
+
+CREATE SCHEMA dist_schema_3;
+CREATE TABLE dist_schema_3.some_dist_table(time timestamptz, device int);
+
+SELECT * FROM test.remote_exec(NULL, $$
+SELECT s.nspname, u.usename
+FROM pg_catalog.pg_namespace s
+JOIN pg_catalog.pg_user u ON u.usesysid = s.nspowner
+WHERE s.nspname = 'dist_schema_3';
+$$);
+
+DROP SCHEMA dist_schema_3 CASCADE;
+
+ROLLBACK;
+
+SELECT * FROM test.remote_exec(NULL, $$
+SELECT s.nspname, u.usename
+FROM pg_catalog.pg_namespace s
+JOIN pg_catalog.pg_user u ON u.usesysid = s.nspowner
+WHERE s.nspname = 'dist_schema_3';
+$$);
+
+-- ALTER SCHEMA RENAME TO
+CREATE SCHEMA dist_schema;
+CREATE TABLE dist_schema.some_dist_table(time timestamptz, device int, color int, temp float);
+SELECT * FROM create_hypertable('dist_schema.some_dist_table', 'time', replication_factor => 3);
+ALTER SCHEMA dist_schema RENAME TO dist_schema_2;
 SELECT * FROM test.remote_exec(NULL, $$ SELECT schemaname, tablename FROM pg_tables WHERE tablename = 'some_dist_table' $$);
+
+-- ALTER SCHEMA OWNER TO
+ALTER SCHEMA dist_schema_2 OWNER TO :ROLE_1;
+
+SELECT * FROM test.remote_exec(NULL, $$
+SELECT s.nspname, u.usename
+FROM pg_catalog.pg_namespace s
+JOIN pg_catalog.pg_user u ON u.usesysid = s.nspowner
+WHERE s.nspname = 'dist_schema_2';
+$$);
+
+DROP SCHEMA dist_schema_2 CASCADE;
 
 -- DROP column cascades to index drop
 CREATE TABLE some_dist_table(time timestamptz, device int, color int, temp float);
@@ -275,6 +358,49 @@ $$);
 \set ON_ERROR_STOP 1
 DROP TABLE some_dist_table;
 DROP TABLE non_htable;
+
+-- Test disabling DDL commands on global objects
+--
+SET timescaledb_experimental.enable_distributed_ddl TO 'off';
+SET client_min_messages TO DEBUG1;
+
+-- CREATE SCHEMA
+CREATE SCHEMA schema_global;
+
+-- Ensure SCHEMA is not created on data nodes
+SELECT * FROM test.remote_exec(NULL, $$
+SELECT s.nspname, u.usename
+FROM pg_catalog.pg_namespace s
+JOIN pg_catalog.pg_user u ON u.usesysid = s.nspowner
+WHERE s.nspname = 'schema_global';
+$$);
+
+-- RENAME SCHEMA
+ALTER SCHEMA schema_global RENAME TO schema_global_2;
+
+-- ALTER SCHEMA OWNER TO
+ALTER SCHEMA schema_global_2 OWNER TO :ROLE_1;
+
+-- REASSIGN OWNED BY TO
+REASSIGN OWNED BY :ROLE_1 TO :ROLE_1;
+
+-- Reset earlier to avoid different debug output between PG versions
+RESET client_min_messages;
+
+-- DROP OWNED BY schema_global_2
+DROP OWNED BY :ROLE_1;
+
+-- DROP SCHEMA
+CREATE SCHEMA schema_global;
+SELECT * FROM test.remote_exec(NULL, $$
+SELECT s.nspname, u.usename
+FROM pg_catalog.pg_namespace s
+JOIN pg_catalog.pg_user u ON u.usesysid = s.nspowner
+WHERE s.nspname = 'schema_global';
+$$);
+DROP SCHEMA schema_global;
+
+SET timescaledb_experimental.enable_distributed_ddl TO 'on';
 
 -- Transactional DDL tests
 -- Single-statement transactions
@@ -551,39 +677,20 @@ DROP INDEX disttable_device_idx;
 
 DROP TABLE disttable;
 
--- Ensure that continuous aggregates are not supported on
--- distributed hypertables
-CREATE TABLE disttable(
-    time timestamptz NOT NULL,
-    device int,
-    value float
-);
-SELECT * FROM create_distributed_hypertable('disttable', 'time', 'device', 3);
-INSERT INTO disttable VALUES
-       ('2017-01-01 06:01', 1, 1.2),
-       ('2017-01-01 09:11', 3, 4.3),
-       ('2017-01-01 08:01', 1, 7.3),
-       ('2017-01-02 08:01', 2, 0.23),
-       ('2018-07-02 08:01', 87, 0.0),
-       ('2018-07-01 06:01', 13, 3.1),
-       ('2018-07-01 09:11', 90, 10303.12),
-       ('2018-07-01 08:01', 29, 64);
-
-\set ON_ERROR_STOP 0
-SELECT id AS dimension_id FROM _timescaledb_catalog.dimension WHERE column_name = 'time' \gset
-SELECT _timescaledb_internal.calculate_chunk_interval(:dimension_id,1484250460,604800000000);
-
-CREATE MATERIALIZED VIEW disttable_cagg WITH (timescaledb.continuous)
-AS SELECT time_bucket('2 days', time), device, max(value)
-    FROM disttable
-    GROUP BY 1, 2 WITH NO DATA;
-\set ON_ERROR_STOP 1
-
+-- Ensure VACUUM/ANALYZE commands can be run on a data node
+-- without enabling timescaledb.enable_client_ddl_on_data_nodes guc
+CREATE TABLE disttable(time timestamptz NOT NULL, device int);
+SELECT * FROM create_distributed_hypertable('disttable', 'time', 'device', replication_factor => 3);
+\c :MY_DB1
+ANALYZE disttable;
+ANALYZE;
+VACUUM disttable;
+VACUUM;
+\c :TEST_DBNAME :ROLE_SUPERUSER;
 DROP TABLE disttable;
 
 -- cleanup
 \c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER;
-DROP SCHEMA disttable_schema CASCADE;
 DROP DATABASE :MY_DB1;
 DROP DATABASE :MY_DB2;
 DROP DATABASE :MY_DB3;

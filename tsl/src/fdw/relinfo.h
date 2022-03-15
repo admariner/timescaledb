@@ -25,7 +25,7 @@
 
 typedef enum
 {
-	TS_FDW_RELINFO_UNKNOWN = 0,
+	TS_FDW_RELINFO_UNINITIALIZED = 0,
 	TS_FDW_RELINFO_HYPERTABLE_DATA_NODE,
 	TS_FDW_RELINFO_HYPERTABLE,
 	TS_FDW_RELINFO_FOREIGN_TABLE,
@@ -130,11 +130,24 @@ typedef struct TsFdwRelInfo
 							   to be only used for printing cost debug
 							   output */
 #endif
+
+	/*
+	 * Moving averages of chunk size, valid for the hypertable relinfo.
+	 * We use them to compute the size for remote chunks that don't have local
+	 * statistics, e.g. because ANALYZE haven't been run. Note that these values
+	 * are adjusted for fill factor, i.e. they correspond to a fill factor of
+	 * 1.0. The fill factor for a particular chunk is estimated separately.
+	 */
+	double average_chunk_pages;
+	double average_chunk_tuples;
+
+	/* Cached chunk data for the chunk relinfo. */
+	struct Chunk *chunk;
 } TsFdwRelInfo;
 
 extern TsFdwRelInfo *fdw_relinfo_create(PlannerInfo *root, RelOptInfo *rel, Oid server_oid,
 										Oid local_table_id, TsFdwRelInfoType type);
-extern TsFdwRelInfo *fdw_relinfo_alloc(RelOptInfo *rel, TsFdwRelInfoType reltype);
+extern TsFdwRelInfo *fdw_relinfo_alloc_or_get(RelOptInfo *rel);
 extern TsFdwRelInfo *fdw_relinfo_get(RelOptInfo *rel);
 
 #endif /* TIMESCALEDB_TSL_FDW_RELINFO_H */

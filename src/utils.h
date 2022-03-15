@@ -11,9 +11,23 @@
 #include <catalog/pg_proc.h>
 #include <common/int.h>
 #include <nodes/pathnodes.h>
+#include <nodes/extensible.h>
 #include <utils/datetime.h>
 
-#include "compat.h"
+#include "compat/compat.h"
+
+/*
+ * Get the function name in a PG_FUNCTION.
+ *
+ * The function name is resolved from the function Oid in the functioncall
+ * data. However, this information is not present in case of a direct function
+ * call, so fall back to the C-function name.
+ */
+#define TS_FUNCNAME()                                                                              \
+	(psprintf("%s()", fcinfo->flinfo ? get_func_name(FC_FN_OID(fcinfo)) : __func__))
+
+#define TS_PREVENT_FUNC_IF_READ_ONLY() PreventCommandIfReadOnly(TS_FUNCNAME())
+#define TS_PREVENT_IN_TRANSACTION_BLOCK(toplevel) PreventInTransactionBlock(toplevel, TS_FUNCNAME())
 
 #define MAX(x, y) ((x) > (y) ? x : y)
 #define MIN(x, y) ((x) < (y) ? x : y)
@@ -46,6 +60,7 @@ typedef bool (*proc_filter)(Form_pg_proc form, void *arg);
 extern TSDLLEXPORT int64 ts_time_value_to_internal(Datum time_val, Oid type);
 extern int64 ts_time_value_to_internal_or_infinite(Datum time_val, Oid type_oid,
 												   TimevalInfinity *is_infinite_out);
+
 extern TSDLLEXPORT int64 ts_interval_value_to_internal(Datum time_val, Oid type_oid);
 
 /*
@@ -81,6 +96,7 @@ extern TSDLLEXPORT Oid ts_get_cast_func(Oid source, Oid target);
 typedef struct Dimension Dimension;
 
 extern TSDLLEXPORT Oid ts_get_integer_now_func(const Dimension *open_dim);
+extern TSDLLEXPORT int64 ts_sub_integer_from_now(int64 interval, Oid time_dim_type, Oid now_func);
 
 extern TSDLLEXPORT void *ts_create_struct_from_slot(TupleTableSlot *slot, MemoryContext mctx,
 													size_t alloc_size, size_t copy_size);
@@ -88,7 +104,9 @@ extern TSDLLEXPORT void *ts_create_struct_from_slot(TupleTableSlot *slot, Memory
 extern TSDLLEXPORT AppendRelInfo *ts_get_appendrelinfo(PlannerInfo *root, Index rti,
 													   bool missing_ok);
 
+#if PG12
 extern TSDLLEXPORT Expr *ts_find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel);
+#endif
 
 extern TSDLLEXPORT bool ts_has_row_security(Oid relid);
 
@@ -150,5 +168,32 @@ ts_clear_flags_32(uint32 bitmap, uint32 flags)
 {
 	return bitmap & ~flags;
 }
+
+/**
+ * Try to register a custom scan method.
+ *
+ * When registering a custom scan node, it might be called multiple times when
+ * different databases have different versions of the extension installed, so
+ * this function can be used to try to register a custom scan method but not
+ * fail if it has already been registered.
+ */
+static inline void
+TryRegisterCustomScanMethods(const CustomScanMethods *methods)
+{
+	if (!GetCustomScanMethods(methods->CustomName, true))
+		RegisterCustomScanMethods(methods);
+}
+
+typedef struct RelationSize
+{
+	int64 total_size;
+	int64 heap_size;
+	int64 toast_size;
+	int64 index_size;
+} RelationSize;
+
+extern TSDLLEXPORT RelationSize ts_relation_size_impl(Oid relid);
+
+extern TSDLLEXPORT const char *ts_get_node_name(Node *node);
 
 #endif /* TIMESCALEDB_UTILS_H */

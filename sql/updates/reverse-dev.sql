@@ -1,3 +1,2 @@
--- Note that 2.4.0 used CREATE VIEW instead of CREATE OR REPLACE VIEW to
--- create this view. This should be part of downgrade to 2.4.0
-DROP VIEW IF EXISTS timescaledb_experimental.chunk_replication_status;
+DROP VIEW _timescaledb_internal.hypertable_chunk_local_size;
+DROP FUNCTION _timescaledb_internal.relation_size(relation REGCLASS);

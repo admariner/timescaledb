@@ -18,6 +18,7 @@
 #include <optimizer/planmain.h>
 #include <optimizer/restrictinfo.h>
 #include <optimizer/tlist.h>
+#include <parser/parse_coerce.h>
 #include <parser/parsetree.h>
 #include <rewrite/rewriteManip.h>
 #include <utils/syscache.h>
@@ -27,8 +28,8 @@
 #include "guc.h"
 #include "nodes/skip_scan/skip_scan.h"
 #include "nodes/constraint_aware_append/constraint_aware_append.h"
-#include "chunk_append/chunk_append.h"
-#include "compat.h"
+#include "nodes/chunk_append/chunk_append.h"
+#include "compat/compat.h"
 
 #include <math.h>
 
@@ -72,14 +73,7 @@ static CustomScanMethods skip_scan_plan_methods = {
 void
 _skip_scan_init(void)
 {
-	/*
-	 * Because we reinitialize the tsl stuff when the license
-	 * changes the init function may be called multiple times
-	 * per session so we check if the SkipScan node has been
-	 * registered already here to prevent registering it twice.
-	 */
-	if (GetCustomScanMethods(skip_scan_plan_methods.CustomName, true) == NULL)
-		RegisterCustomScanMethods(&skip_scan_plan_methods);
+	TryRegisterCustomScanMethods(&skip_scan_plan_methods);
 }
 
 static Plan *
@@ -210,11 +204,21 @@ tsl_skip_scan_paths_add(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *ou
 			break;
 		}
 	}
+
 	/* no UniquePath found so this query might not be
 	 * elegible for sort-based DISTINCT and therefore
 	 * not elegible for SkipScan either */
 	if (!unique)
 		return;
+
+	/* Need to make a copy of the unique path here because add_path() in the
+	 * pathlist loop below might prune it if the new unique path
+	 * (SkipScanPath) dominates the old one. When the unique path is pruned,
+	 * the pointer will no longer be valid in the next iteration of the
+	 * pathlist loop. Fortunately, the Path object is not deeply freed, so a
+	 * shallow copy is enough. */
+	unique = makeNode(UpperUniquePath);
+	memcpy(unique, lfirst_node(UpperUniquePath, lc), sizeof(UpperUniquePath));
 
 	foreach (lc, input_rel->pathlist)
 	{
@@ -266,12 +270,12 @@ tsl_skip_scan_paths_add(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *ou
 			if (!new_paths)
 				continue;
 
-			subpath = (Path *) create_merge_append_path(root,
-														merge_path->path.parent,
-														new_paths,
-														merge_path->path.pathkeys,
-														NULL,
-														merge_path->partitioned_rels);
+			subpath = (Path *) create_merge_append_path_compat(root,
+															   merge_path->path.parent,
+															   new_paths,
+															   merge_path->path.pathkeys,
+															   NULL,
+															   merge_path->partitioned_rels);
 			subpath->pathtarget = copy_pathtarget(merge_path->path.pathtarget);
 		}
 		else if (ts_is_chunk_append_path(subpath))
@@ -536,7 +540,26 @@ build_skip_qual(PlannerInfo *root, SkipScanPath *skip_scan_path, IndexPath *inde
 	Oid column_type = exprType((Node *) var);
 	Oid column_collation = get_typcollation(column_type);
 	TypeCacheEntry *tce = lookup_type_cache(column_type, 0);
+	bool need_coerce = false;
+
+	/*
+	 * Skipscan is not applicable for the following case:
+	 * We might have a path with an index that produces the correct pathkeys for the target ordering
+	 * without actually including all the columns of the ORDER BY. If the path uses an index that
+	 * does not include the distinct column, we cannot use it for skipscan and have to discard this
+	 * path from skipscan generation. This happens, for instance, when we have an order by clause
+	 * (like ORDER BY a, b) with constraints in the WHERE clause (like WHERE a = <constant>) . "a"
+	 * can now be removed from the Pathkeys (since it is a constant) and the query can be satisfied
+	 * by using an index on just column "b".
+	 *
+	 * Example query:
+	 * SELECT DISTINCT ON (a) * FROM test WHERE a in (2) ORDER BY a ASC, time DESC;
+	 * Since a is always 2 due to the WHERE clause we can create the correct ordering for the
+	 * ORDER BY with an index that does not include the a column and only includes the time column.
+	 */
 	int idx_key = get_idx_key(info, var->varattno);
+	if (idx_key < 0)
+		return false;
 
 	skip_scan_path->distinct_attno = var->varattno;
 	skip_scan_path->distinct_by_val = tce->typbyval;
@@ -550,24 +573,51 @@ build_skip_qual(PlannerInfo *root, SkipScanPath *skip_scan_path, IndexPath *inde
 		strategy =
 			(strategy == BTLessStrategyNumber) ? BTGreaterStrategyNumber : BTLessStrategyNumber;
 	}
+	Oid opcintype = info->opcintype[idx_key];
 
 	Oid comparator =
 		get_opfamily_member(info->sortopfamily[idx_key], column_type, column_type, strategy);
-	if (!OidIsValid(comparator))
-		return false; /* cannot use this index */
 
-	Const *prev_val = makeNullConst(column_type, -1, column_collation);
-	Var *current_val = makeVar(info->rel->relid /*varno*/,
-							   var->varattno /*varattno*/,
-							   column_type /*vartype*/,
-							   -1 /*vartypmod*/,
-							   column_collation /*varcollid*/,
-							   0 /*varlevelsup*/);
+	/* If there is no exact operator match for the column type we have here check
+	 * if we can coerce to the type of the operator class. */
+	if (!OidIsValid(comparator))
+	{
+		if (IsBinaryCoercible(column_type, opcintype))
+		{
+			comparator =
+				get_opfamily_member(info->sortopfamily[idx_key], opcintype, opcintype, strategy);
+			if (!OidIsValid(comparator))
+				return false;
+			need_coerce = true;
+		}
+		else
+			return false; /* cannot use this index */
+	}
+
+	Const *prev_val = makeNullConst(need_coerce ? opcintype : column_type, -1, column_collation);
+	Expr *current_val = (Expr *) makeVar(info->rel->relid /*varno*/,
+										 var->varattno /*varattno*/,
+										 column_type /*vartype*/,
+										 -1 /*vartypmod*/,
+										 column_collation /*varcollid*/,
+										 0 /*varlevelsup*/);
+
+	if (need_coerce)
+	{
+		CoerceViaIO *coerce = makeNode(CoerceViaIO);
+		coerce->arg = current_val;
+		coerce->resulttype = opcintype;
+		coerce->resultcollid = column_collation;
+		coerce->coerceformat = COERCE_IMPLICIT_CAST;
+		coerce->location = -1;
+
+		current_val = &coerce->xpr;
+	}
 
 	Expr *comparison_expr = make_opclause(comparator,
 										  BOOLOID /*opresulttype*/,
 										  false /*opretset*/,
-										  &current_val->xpr /*leftop*/,
+										  current_val /*leftop*/,
 										  &prev_val->xpr /*rightop*/,
 										  InvalidOid /*opcollid*/,
 										  info->indexcollations[idx_key] /*inputcollid*/);
@@ -586,9 +636,7 @@ get_idx_key(IndexOptInfo *idxinfo, AttrNumber attno)
 		if (attno == idxinfo->indexkeys[i])
 			return i;
 	}
-
-	elog(ERROR, "column not present in index: %d", attno);
-	pg_unreachable();
+	return -1;
 }
 
 /* Sort quals according to index column order.
@@ -638,7 +686,8 @@ fix_indexqual(IndexOptInfo *index, RestrictInfo *rinfo, AttrNumber scankey_attno
 
 	/* fix_indexqual_operand */
 	Assert(index->indexkeys[scankey_attno - 1] != 0);
-	Var *node = linitial_node(Var, op->args);
+	Var *node = linitial_node(Var, pull_var_clause(linitial(op->args), 0));
+
 	Assert(((Var *) node)->varno == index->rel->relid &&
 		   ((Var *) node)->varattno == index->indexkeys[scankey_attno - 1]);
 

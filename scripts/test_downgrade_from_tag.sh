@@ -82,8 +82,8 @@ docker_pgcmd() {
     local database=${3:-single}
     echo "executing pgcmd on database $database"
     set +e
-    docker_exec $1 "psql -h localhost -U postgres -d $database $PGOPTS -v VERBOSITY=verbose -c \"$2\""
-    if [ $? -ne 0 ]; then
+    if ! docker_exec $1 "psql -h localhost -U postgres -d $database $PGOPTS -v VERBOSITY=verbose -c \"$2\""
+    then
       docker_logs $1
       exit 1
     fi
@@ -99,8 +99,8 @@ docker_pgtest() {
     local database=${3:-single}
     set +e
     >&2 echo -e "\033[1m$1\033[0m: $2"
-    docker exec $1 psql -X -v ECHO=ALL -v ON_ERROR_STOP=1 -h localhost -U postgres -d $database -f $2 > ${TEST_TMPDIR}/$1.out
-    if [ $? -ne 0 ]; then
+    if ! docker exec $1 psql -X -v ECHO=ALL -v ON_ERROR_STOP=1 -h localhost -U postgres -d $database -f $2 > ${TEST_TMPDIR}/$1.out
+    then
       docker_logs $1
       exit 1
     fi
@@ -114,12 +114,12 @@ docker_pgdiff_all() {
     docker_pgtest ${CONTAINER_UPDATED} $1 $database
     docker_pgtest ${CONTAINER_CLEAN_RESTORE} $1 $database
     docker_pgtest ${CONTAINER_CLEAN_RERUN} $1 $database
-    echo "Diffing updated container vs restored. Updated: ${CONTAINER_UPDATED} restored: ${CONTAINER_CLEAN_RESTORE}" 
+    echo "Diffing downgraded container vs restored. Downgraded: ${CONTAINER_UPDATED} restored: ${CONTAINER_CLEAN_RESTORE}" 
     diff -u ${TEST_TMPDIR}/${CONTAINER_UPDATED}.out ${TEST_TMPDIR}/${CONTAINER_CLEAN_RESTORE}.out | tee ${diff_file1}
     if [ ! -s ${diff_file1} ]; then
       rm ${diff_file1}
     fi
-    echo "Diffing updated container vs clean run. Updated: ${CONTAINER_UPDATED} clean run: ${CONTAINER_CLEAN_RERUN}"
+    echo "Diffing downgraded container vs clean run. Downgraded: ${CONTAINER_UPDATED} clean run: ${CONTAINER_CLEAN_RERUN}"
     diff -u ${TEST_TMPDIR}/${CONTAINER_UPDATED}.out ${TEST_TMPDIR}/${CONTAINER_CLEAN_RERUN}.out | tee ${diff_file2}
     if [ ! -s ${diff_file2} ]; then
       rm ${diff_file2}
@@ -138,12 +138,11 @@ docker_run_vol() {
 
 wait_for_pg() {
     set +e
-    for i in {1..20}; do
+    for _ in {1..20}; do
         sleep 1
 
-        docker_exec $1 "pg_isready -U postgres"
-
-        if [[ $? == 0 ]] ; then
+        if docker_exec $1 "pg_isready -U postgres"
+        then
             # this makes the test less flaky, although not
             # ideal. Apperently, pg_isready is not always a good
             # indication of whether the DB is actually ready to accept
@@ -158,7 +157,8 @@ wait_for_pg() {
     exit 1
 }
 
-VERSION=`echo ${UPDATE_FROM_TAG} | sed 's/\([0-9]\{0,\}\.[0-9]\{0,\}\.[0-9]\{0,\}\).*/\1/g'`
+# shellcheck disable=SC2001 # SC2001 -- See if you can use ${variable//search/replace} instead.
+VERSION=$(echo ${UPDATE_FROM_TAG} | sed 's/\([0-9]\{0,\}\.[0-9]\{0,\}\.[0-9]\{0,\}\).*/\1/g')
 echo "Testing from version ${VERSION} (test version ${TEST_VERSION})"
 echo "Using temporary directory ${TEST_TMPDIR}"
 
@@ -194,19 +194,19 @@ docker_pgcmd ${CONTAINER_ORIG} "CHECKPOINT;"
 srcdir=$(docker exec ${CONTAINER_ORIG} /bin/bash -c 'pg_config --pkglibdir')
 FILES=$(docker exec ${CONTAINER_ORIG} /bin/bash -c "ls $srcdir/timescaledb*.so")
 for file in $FILES; do
-    docker cp ${CONTAINER_ORIG}:$file ${TEST_TMPDIR}/`basename $file`
+    docker cp "${CONTAINER_ORIG}:$file" "${TEST_TMPDIR}/$(basename $file)"
 done
 
 # Remove container but keep volume
 docker rm -f ${CONTAINER_ORIG}
 
-echo "Running update container"
+echo "Running downgraded container"
 docker_run_vol ${CONTAINER_UPDATED} ${UPDATE_VOLUME}:/var/lib/postgresql/data ${UPDATE_TO_IMAGE}:${UPDATE_TO_TAG}
 
 dstdir=$(docker exec ${CONTAINER_UPDATED} /bin/bash -c 'pg_config --pkglibdir')
 for file in $FILES; do
-    docker cp ${TEST_TMPDIR}/`basename $file` ${CONTAINER_UPDATED}:$dstdir
-    rm ${TEST_TMPDIR}/`basename $file`
+    docker cp "${TEST_TMPDIR}/$(basename $file)" "${CONTAINER_UPDATED}:$dstdir"
+    rm "${TEST_TMPDIR}/$(basename $file)"
 done
 
 echo "==== 1. check caggs ===="
@@ -241,6 +241,7 @@ echo "Executing setup script on clean"
 docker_pgscript ${CONTAINER_CLEAN_RERUN} /src/test/sql/updates/setup.databases.sql "postgres"
 docker_pgscript ${CONTAINER_CLEAN_RERUN} /src/test/sql/updates/pre.testing.sql
 docker_pgscript ${CONTAINER_CLEAN_RERUN} /src/test/sql/updates/setup.${TEST_VERSION}.sql
+docker_pgscript ${CONTAINER_CLEAN_RERUN} /src/test/sql/updates/setup.post-downgrade.sql
 
 docker_exec ${CONTAINER_UPDATED} "pg_dump -h localhost -U postgres -Fc single > /tmp/single.dump"
 docker_exec ${CONTAINER_UPDATED} "pg_dump -h localhost -U postgres -Fc dn1 > /tmp/dn1.dump"
@@ -263,5 +264,5 @@ docker_pgcmd ${CONTAINER_CLEAN_RESTORE} "ALTER DATABASE dn1 SET timescaledb.rest
 docker_exec ${CONTAINER_CLEAN_RESTORE} "pg_restore -h localhost -U postgres -d dn1 /tmp/dn1.dump"
 docker_pgcmd ${CONTAINER_CLEAN_RESTORE} "ALTER DATABASE dn1 RESET timescaledb.restoring"
 
-echo "Comparing upgraded ($UPDATE_FROM_TAG -> $UPDATE_FROM_TAG) with clean install ($UPDATE_FROM_TAG)"
+echo "Comparing downgraded ($UPDATE_FROM_TAG -> $UPDATE_FROM_TAG) with clean install ($UPDATE_FROM_TAG)"
 docker_pgdiff_all /src/test/sql/updates/post.${TEST_VERSION}.sql "single"
